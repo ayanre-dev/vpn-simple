@@ -1,0 +1,4 @@
+cryptography
+dnslib
+fastapi
+uvicorn[standard]

@@ -1,0 +1,53 @@
+#for env
+.\.venv\Scripts\activate.ps1
+
+#for idfk
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
+#for relay
+
+$env:ROLE = "relay"
+$env:HOST = "0.0.0.0"
+$env:PORT = "8443"              # use 443 on VPS if you can
+$env:SHARED_KEY_FILE = "shared.key"
+
+python -m backend.src.server
+
+#for edge
+
+$env:ROLE = "edge"
+$env:RELAY_HOST = "127.0.0.1"    # change to your VPS/domain
+$env:RELAY_PORT = "8443"         # must match relay
+$env:UPSTREAM_DNS = "1.1.1.1"    # use campus resolver if you want “inside eduroam” DNS
+$env:SHARED_KEY_FILE = "shared.key"
+
+python -m backend.src.server
+
+#for ui
+
+cd C:\Users\hp\Desktop\vpn-simple\frontend\web-ui
+$env:VITE_API_BASE = "http://localhost:8000"
+npm run dev -- --host 0.0.0.0 --port 4173
+
+#for client
+
+$env:RELAY_HOST = "127.0.0.1"    # or your VPS/domain
+$env:RELAY_PORT = "8443"
+$env:SHARED_KEY_FILE = "C:\Users\hp\Desktop\vpn-simple\shared.key"
+$env:DNS_QUERY = "example.com"
+
+python .\frontend\client-cli\src\client.py
+
+#control_api.py
+
+cd C:\Users\hp\Desktop\vpn-simple
+& .\.venv\Scripts\Activate.ps1
+$env:RELAY_HOST="127.0.0.1"
+$env:RELAY_PORT="8443"
+$env:SHARED_KEY_FILE="C:\Users\hp\Desktop\vpn-simple\shared.key"
+$env:DNS_QUERY="example.com"
+$env:DNS_LISTEN_HOST="127.0.0.1"
+$env:DNS_LISTEN_PORT="53530"
+$env:SOCKS_LISTEN_HOST="127.0.0.1"
+$env:SOCKS_LISTEN_PORT="1080"
+uvicorn backend.src.control_api:app --host 0.0.0.0 --port 8000
