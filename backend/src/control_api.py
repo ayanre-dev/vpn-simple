@@ -9,9 +9,19 @@ from backend.src.server import Client
 from backend.src.config import load_key
 from backend.src.dns_forwarder import DNSForwarder, DNSForwarderState
 from backend.src.socks5_proxy import Socks5Proxy, Socks5State  # new
+from fastapi.middleware.cors import CORSMiddleware
+
 
 log = get_logger("control_api")
 app = FastAPI(title="VPN Simple Control API", version="0.1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # or restrict to your dev origin
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class StatusResponse(BaseModel):
     connected: bool

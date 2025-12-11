@@ -5,6 +5,15 @@ const api = axios.create({
   timeout: 5000,
 });
 
-export const getStatus = async () => (await api.get("/status")).data;
-export const triggerConnect = async () => (await api.post("/connect")).data;
-export const triggerDisconnect = async () => (await api.post("/disconnect")).data;
+export type Status = {
+  connected: boolean;
+  relay_host: string;
+  relay_port: number;
+  dns_query: string;
+  error?: string | null;
+};
+
+export const getStatus = async (): Promise<Status> => (await api.get("/status")).data;
+export const triggerConnect = async (): Promise<Status> => (await api.post("/connect")).data;
+export const triggerDisconnect = async (): Promise<{ disconnected: boolean }> =>
+  (await api.post("/disconnect")).data;

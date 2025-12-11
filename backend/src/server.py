@@ -260,28 +260,29 @@ class Relay:
                 self.edge_writer = None
 
     async def _pump(self, reader, writer, from_edge: bool):
-        buf = bytearray()
+        """
+        Pass-through pump: forward raw framed bytes (len prefix + ciphertext)
+        without decrypting or re-framing. This keeps framing intact between
+        clients and edge.
+        """
         while True:
             data = await reader.read(4096)
             if not data:
                 break
-            buf.extend(data)
-            frames = decode_frames(buf)
-            for f in frames:
-                if from_edge:
-                    dead = []
-                    for cw in self.clients:
-                        try:
-                            cw.write(f)        # forward raw encrypted frame
-                            await cw.drain()
-                        except Exception:
-                            dead.append(cw)
-                    for d in dead:
-                        self.clients.discard(d)
-                else:
-                    if self.edge_writer:
-                        self.edge_writer.write(f)   # forward raw encrypted frame
-                        await self.edge_writer.drain()
+            if from_edge:
+                dead = []
+                for cw in self.clients:
+                    try:
+                        cw.write(data)
+                        await cw.drain()
+                    except Exception:
+                        dead.append(cw)
+                for d in dead:
+                    self.clients.discard(d)
+            else:
+                if self.edge_writer:
+                    self.edge_writer.write(data)
+                    await self.edge_writer.drain()
         # end
 
 
