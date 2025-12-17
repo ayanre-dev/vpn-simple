@@ -7,6 +7,7 @@ from typing import Optional
 
 from backend.src.logger import get_logger
 from backend.src.crypto import AESTunnel  # make sure backend/src/crypto.py exists
+from shared.handshake import client_handshake, edge_handshake
 
 log = get_logger("server")
 
@@ -92,10 +93,31 @@ class ClientTCPConnection:
 
 
 class Client:
-    def __init__(self, key: bytes, relay_host: str, relay_port: int):
-        self.tunnel = AESTunnel(key)
+    def __init__(self, key: bytes | None, relay_host: str, relay_port: int):
+        # PSK tunnel retained for backward compatibility; handshake may override per-connection.
+        # When key is None, handshake becomes mandatory.
+        self.tunnel: AESTunnel | None = AESTunnel(key) if key is not None else None
         self.relay_host = relay_host
         self.relay_port = relay_port
+        # Optional server public key (Ed25519) to enable handshake
+        self._edge_pubkey: bytes | None = None
+        edge_pub_path = os.environ.get("EDGE_PUBKEY_FILE")
+        if edge_pub_path and os.path.exists(edge_pub_path):
+            with open(edge_pub_path, "rb") as f:
+                pk = f.read().strip()
+            # Expect raw 32-byte Ed25519 public key
+            if len(pk) == 32:
+                self._edge_pubkey = pk
+            else:
+                log.warning("EDGE_PUBKEY_FILE present but not 32 bytes; ignoring")
+
+    async def _maybe_handshake(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> AESTunnel:
+        if self._edge_pubkey is None:
+            if self.tunnel is None:
+                raise RuntimeError("No handshake configured and no pre-shared key provided")
+            return self.tunnel
+        session_key = await client_handshake(reader, writer, self._edge_pubkey)
+        return AESTunnel(session_key)
 
     async def run_dns_query(self, qdata: bytes):
         reader, writer = await asyncio.open_connection(
@@ -103,7 +125,8 @@ class Client:
         )
         writer.write(encode_frame(control_msg("hello", {"role": "client"})))
         await writer.drain()
-        writer.write(encode_frame(self.tunnel.encrypt(b"DNS" + qdata)))
+        tunnel = await self._maybe_handshake(reader, writer)
+        writer.write(encode_frame(tunnel.encrypt(b"DNS" + qdata)))
         await writer.drain()
         buf = bytearray()
         try:
@@ -115,7 +138,7 @@ class Client:
                 frames = decode_frames(buf)
                 for f in frames:
                     try:
-                        msg = self.tunnel.decrypt(f)
+                        msg = tunnel.decrypt(f)
                     except Exception as e:
                         log.error("Client DNS decrypt failed: %s", e)
                         continue
@@ -133,15 +156,17 @@ class Client:
         writer.write(encode_frame(control_msg("hello", {"role": "client"})))
         await writer.drain()
 
+        tunnel = await self._maybe_handshake(reader, writer)
+
         cid = os.urandom(4)
         host_b = host.encode()
         init_payload = bytes([len(host_b)]) + host_b + port.to_bytes(2, "big")
         writer.write(
-            encode_frame(self.tunnel.encrypt(b"TCP" + bytes([TCP_INIT]) + cid + init_payload))
+            encode_frame(tunnel.encrypt(b"TCP" + bytes([TCP_INIT]) + cid + init_payload))
         )
         await writer.drain()
 
-        conn = ClientTCPConnection(cid, writer, self.tunnel)
+        conn = ClientTCPConnection(cid, writer, tunnel)
         ready = asyncio.Event()
 
         async def reader_task():
@@ -155,7 +180,7 @@ class Client:
                     frames = decode_frames(buf)
                     for f in frames:
                         try:
-                            msg = self.tunnel.decrypt(f)
+                            msg = tunnel.decrypt(f)
                         except Exception as e:
                             log.error("Client TCP decrypt failed: %s", e)
                             continue
@@ -316,6 +341,7 @@ class Edge:
     Connects to relay as role=edge, handles DNS and TCP frames.
     """
     def __init__(self, key: bytes, relay_host: str, relay_port: int, upstream_dns: str = "1.1.1.1"):
+        # Default PSK tunnel (fallback)
         self.tunnel = AESTunnel(key)
         self.relay_host = relay_host
         self.relay_port = relay_port
@@ -323,6 +349,16 @@ class Edge:
         self.reader: asyncio.StreamReader | None = None
         self.writer: asyncio.StreamWriter | None = None
         self._tcp_conns: dict[bytes, dict] = {}
+        # Optional edge static key for handshake (Ed25519 private key, 32 bytes)
+        self._edge_sk: bytes | None = None
+        edge_sk_path = os.environ.get("EDGE_SK_FILE")
+        if edge_sk_path and os.path.exists(edge_sk_path):
+            with open(edge_sk_path, "rb") as f:
+                sk = f.read().strip()
+            if len(sk) == 32:
+                self._edge_sk = sk
+            else:
+                log.warning("EDGE_SK_FILE present but not 32 bytes; ignoring")
 
     async def start(self):
         while True:
@@ -340,6 +376,11 @@ class Edge:
         writer.write(encode_frame(control_msg("hello", {"role": "edge"})))
         await writer.drain()
         log.info("Edge connected to relay %s:%s", self.relay_host, self.relay_port)
+
+        # If handshake is enabled, run it to derive session tunnel
+        if self._edge_sk is not None:
+            session_key = await edge_handshake(reader, writer, self._edge_sk)
+            self.tunnel = AESTunnel(session_key)
 
         buf = bytearray()
         try:
