@@ -99,8 +99,13 @@ async def connect():
         if _connected and _client:
             return StatusResponse(connected=True, relay_host=relay_host, relay_port=relay_port, dns_query=dns_query, error=None)
         try:
-            key = load_key(key_file)
-            client = Client(key, relay_host, relay_port)
+            # Prefer handshake-only mode when EDGE_PUBKEY_FILE is configured
+            edge_pub = os.environ.get("EDGE_PUBKEY_FILE")
+            if edge_pub and os.path.exists(edge_pub):
+                client = Client(None, relay_host, relay_port)
+            else:
+                key = load_key(key_file)
+                client = Client(key, relay_host, relay_port)
             await _set_client(client, True, None)
             await _ensure_dns_forwarder(client, dns_listen_host, dns_listen_port)
             await _ensure_socks_proxy(client, socks_listen_host, socks_listen_port)
