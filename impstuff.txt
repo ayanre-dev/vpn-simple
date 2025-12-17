@@ -2,7 +2,7 @@
 .\.venv\Scripts\activate.ps1
 
 #for idfk
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 
 #for relay
 
@@ -25,8 +25,8 @@ python -m backend.src.server
 
 #for ui
 
-cd C:\Users\hp\Desktop\vpn-simple\frontend\web-ui
-$env:VITE_API_BASE = "http://localhost:8000"
+cd F:\Users\DELL\Documents\GitHub\vpn-simple\frontend\web-ui
+$env:VITE_API_BASE = "http://localhost:9001"
 npm run dev -- --host 0.0.0.0 --port 4173
 
 #for client
@@ -38,16 +38,17 @@ $env:DNS_QUERY = "example.com"
 
 python .\frontend\client-cli\src\client.py
 
+separate = $env:DNS_QUERY="example.com"
+
 #control_api.py
 
-cd C:\Users\hp\Desktop\vpn-simple
+cd F:\Users\DELL\Documents\GitHub\vpn-simple
 & .\.venv\Scripts\Activate.ps1
-$env:RELAY_HOST="127.0.0.1"
-$env:RELAY_PORT="8443"
-$env:SHARED_KEY_FILE="C:\Users\hp\Desktop\vpn-simple\shared.key"
-$env:DNS_QUERY="example.com"
+$env:RELAY_HOST="0.tcp.ap.ngrok.io"
+$env:RELAY_PORT="10762"
+$env:SHARED_KEY_FILE="F:\Users\DELL\Documents\GitHub\vpn-simple\shared.key"
 $env:DNS_LISTEN_HOST="127.0.0.1"
-$env:DNS_LISTEN_PORT="53530"
+$env:DNS_LISTEN_PORT="53"
 $env:SOCKS_LISTEN_HOST="127.0.0.1"
-$env:SOCKS_LISTEN_PORT="1080"
-uvicorn backend.src.control_api:app --host 0.0.0.0 --port 8000
+$env:SOCKS_LISTEN_PORT="1081"
+uvicorn backend.src.control_api:app --host 127.0.0.1 --port 9001

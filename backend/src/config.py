@@ -6,7 +6,7 @@ class Config:
     ROLE = os.getenv("ROLE", "relay")  # relay | edge
     RELAY_HOST = os.getenv("RELAY_HOST", "127.0.0.1")
     RELAY_PORT = int(os.getenv("RELAY_PORT", PORT))
-    SHARED_KEY_FILE = os.getenv("SHARED_KEY_FILE", r"C:\Users\hp\Desktop\vpn-simple\shared.key")
+    SHARED_KEY_FILE = os.getenv("SHARED_KEY_FILE", r"../../shared.key")
     UPSTREAM_DNS = os.getenv("UPSTREAM_DNS", "1.1.1.1")
     CONTROL_API_PORT = int(os.getenv("CONTROL_API_PORT", "8443"))
     TLS_CERT = os.getenv("TLS_CERT")
