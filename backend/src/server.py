@@ -6,7 +6,6 @@ import ssl
 from typing import Optional, Dict
 
 from backend.src.logger import get_logger
-from backend.src.crypto import AESTunnel  # make sure backend/src/crypto.py exists
 from shared.handshake import client_handshake, edge_handshake
 
 log = get_logger("server")
@@ -325,7 +324,8 @@ class AESTunnel:
         self.dec_nonce += 1
         return aesgcm.decrypt(nonce, ciphertext, None)
 
-# ... (rest of helper functions unchanged)
+
+# Control frames are JSON
 
 class Relay:
     """
