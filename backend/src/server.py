@@ -54,12 +54,9 @@ def enable_keepalive(sock: socket.socket):
             # Linux: number of keepalive probes before giving up
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
         
-        # Windows uses different settings - just try and ignore if it fails
-        if os.name == 'nt' and hasattr(sock, 'ioctl'):
-            try:
-                sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 60000, 30000))
-            except Exception:
-                pass
+        # Windows uses different settings - DISABLING SIO_KEEPALIVE_VALS as it causes WinError 121
+        # The app-level PING/PONG heartbeat is sufficient.
+        pass
     except Exception:
         pass
 
@@ -151,7 +148,11 @@ class Client:
         self._heartbeat_task = None
 
     def is_connected(self) -> bool:
-        return self._writer is not None and self._read_task is not None and not self._read_task.done()
+        return (self._writer is not None and 
+                self._reader is not None and 
+                not self._reader.at_eof() and
+                self._read_task is not None and 
+                not self._read_task.done())
 
     async def connect(self):
         async with self._conn_lock:
@@ -257,6 +258,9 @@ class Client:
                             conn.closed.set()
                             await conn.recv_q.put(None)
                             self._tcp_conns.pop(cid, None)
+        except (asyncio.CancelledError, ConnectionResetError, BrokenPipeError, OSError) as e:
+            # Catching OSError for WinError 64/121
+            log.info("Client session ended: %s", str(e) or e.__class__.__name__)
         except Exception as e: 
             log.error("Client read loop error: %s", e)
         finally: 
@@ -547,6 +551,9 @@ class Relay:
                 buf.extend(chunk)
                 if not await forward_frames():
                     break
+            except (asyncio.CancelledError, ConnectionResetError, BrokenPipeError, OSError) as e:
+                log.info("Relay pump ended: %s", str(e) or e.__class__.__name__)
+                break
             except Exception as e:
                 log.error("Relay pump error: %s", e)
                 break

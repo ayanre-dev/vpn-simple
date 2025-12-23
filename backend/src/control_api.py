@@ -129,8 +129,8 @@ async def _reconnect_loop():
                 
                 log.info("Reconnected successfully")
             
-            # Wait before checking again - very relaxed
-            await asyncio.sleep(20)
+            # Wait before checking again - 5s is a good balance for Ngrok
+            await asyncio.sleep(5)
             
         except Exception as e:
             log.error("Reconnect loop error: %s", e)
