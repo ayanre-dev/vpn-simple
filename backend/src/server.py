@@ -119,6 +119,7 @@ class Client:
         self._tcp_conns: Dict[bytes, ClientTCPConnection] = {}
         self._dns_futures: Dict[int, asyncio.Future] = {}
         self._dns_tag_counter = 0
+        self._reconnect_task = None
 
     def is_connected(self) -> bool:
         return self._writer is not None and self._read_task is not None and not self._read_task.done()
@@ -128,9 +129,15 @@ class Client:
             if self.is_connected(): 
                 return
             
-            reader, writer = await asyncio.open_connection(
-                self.relay_host, self.relay_port, ssl=_maybe_tls()
-            )
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(self.relay_host, self.relay_port, ssl=_maybe_tls()),
+                    timeout=10
+                )
+            except Exception as e:
+                log.error("Failed to connect to relay: %s", e)
+                raise
+            
             self._reader, self._writer = reader, writer
             
             # Initialize tunnel with key
@@ -150,16 +157,23 @@ class Client:
         buf = bytearray()
         try:
             while True:
-                data = await self._reader.read(4096)
+                try:
+                    data = await asyncio.wait_for(self._reader.read(4096), timeout=60)
+                except asyncio.TimeoutError:
+                    # Heartbeat check - connection still alive
+                    continue
+                    
                 if not data: 
                     log.warning("Client connection closed by relay")
                     break
+                    
                 buf.extend(data)
                 for f in decode_frames(buf):
                     try:
                         msg = self.tunnel.decrypt(f)
                     except Exception as e:
-                        log.error("Client decrypt failed (len=%d): %s", len(f), e)
+                        log.error("Client decrypt failed (len=%d, first 16 bytes: %s): %s", 
+                                 len(f), f[:16].hex() if len(f) >= 16 else f.hex(), e)
                         continue
                     
                     if msg.startswith(b"DNS"):
@@ -175,10 +189,10 @@ class Client:
                         if opcode == TCP_READY: 
                             conn.established.set()
                         elif opcode == TCP_DATA: 
-                            conn.recv_q.put_nowait(payload)
+                            await conn.recv_q.put(payload)
                         elif opcode in (TCP_CLOSE, TCP_ERR):
                             conn.closed.set()
-                            conn.recv_q.put_nowait(None)
+                            await conn.recv_q.put(None)
                             self._tcp_conns.pop(cid, None)
         except Exception as e: 
             log.error("Client read loop error: %s", e)
@@ -193,9 +207,16 @@ class Client:
             except Exception: 
                 pass
         self._writer = self._reader = None
+        
+        # Fail all pending operations
+        for fut in list(self._dns_futures.values()):
+            if not fut.done():
+                fut.set_exception(ConnectionError("Client disconnected"))
+        self._dns_futures.clear()
+        
         for conn in list(self._tcp_conns.values()):
             conn.closed.set()
-            conn.recv_q.put_nowait(None)
+            await conn.recv_q.put(None)
         self._tcp_conns.clear()
         log.info("Client cleaned up")
 
@@ -253,11 +274,14 @@ class Client:
 
     async def send_tcp_data(self, cid: bytes, data: bytes):
         if self.is_connected():
-            async with self._writer_lock:
-                self._writer.write(encode_frame(
-                    self.tunnel.encrypt(b"TCP" + bytes([TCP_DATA]) + cid + data)
-                ))
-                await self._writer.drain()
+            try:
+                async with self._writer_lock:
+                    self._writer.write(encode_frame(
+                        self.tunnel.encrypt(b"TCP" + bytes([TCP_DATA]) + cid + data)
+                    ))
+                    await self._writer.drain()
+            except Exception as e:
+                log.error("Failed to send TCP data: %s", e)
 
     async def send_tcp_close(self, cid: bytes):
         if self.is_connected():
@@ -274,10 +298,12 @@ class Client:
 class Relay:
     def __init__(self, key: bytes, host: str, port: int):
         self.host, self.port = host, port
-        self.key = key  # Store key but don't create tunnel (relay just forwards)
+        self.key = key
         self.edge_queue = None
         self.active_client = None
+        self.active_client_id = None
         self.client_queues = {}
+        self._client_id_counter = 0
 
     async def start(self):
         server = await asyncio.start_server(
@@ -293,8 +319,12 @@ class Relay:
                 data = await queue.get()
                 if data is None: 
                     break
-                writer.write(data)
-                await writer.drain()
+                try:
+                    writer.write(data)
+                    await writer.drain()
+                except Exception as e:
+                    log.error("Writer task error for %s: %s", name, e)
+                    break
                 queue.task_done()
         finally:
             try: 
@@ -331,16 +361,18 @@ class Relay:
             w_task = asyncio.create_task(self._writer_task(writer, queue, role))
             
             if role == "client":
-                # Close old client if exists
-                if self.active_client in self.client_queues:
-                    old_queue = self.client_queues.pop(self.active_client)
-                    old_queue.put_nowait(None)
-                    log.info("Relay: Disconnected previous client")
+                self._client_id_counter += 1
+                client_id = self._client_id_counter
+                
+                # DON'T close old client immediately - let it drain naturally
+                if self.active_client and self.active_client != writer:
+                    log.info("Relay: New client %d, old client will be replaced", client_id)
                 
                 self.active_client = writer
+                self.active_client_id = client_id
                 self.client_queues[writer] = queue
                 
-                # Drain edge queue to prevent nonce issues
+                # Drain edge queue only if edge exists
                 if self.edge_queue:
                     count = 0
                     while not self.edge_queue.empty():
@@ -352,9 +384,9 @@ class Relay:
                     if count > 0:
                         log.info("Relay: Drained %d stale packets from edge queue", count)
                     
-                    # Forward hello to edge so it knows new session started
+                    # Forward hello to edge
                     self.edge_queue.put_nowait(encode_frame(hello_frame))
-                    log.info("Relay: Forwarded client hello to edge")
+                    log.info("Relay: Forwarded client %d hello to edge", client_id)
             
             elif role == "edge":
                 self.edge_queue = queue
@@ -370,10 +402,11 @@ class Relay:
                 await self._pump(reader, writer, True, initial_data)
                 self.edge_queue = None
             elif role == "client":
-                await self._pump(reader, writer, False, initial_data)
+                await self._pump(reader, writer, False, initial_data, client_id)
                 self.client_queues.pop(writer, None)
                 if self.active_client == writer: 
                     self.active_client = None
+                    self.active_client_id = None
             
             queue.put_nowait(None)
             await w_task
@@ -386,32 +419,43 @@ class Relay:
             except Exception: 
                 pass
 
-    async def _pump(self, reader, writer, from_edge, initial_buf):
+    async def _pump(self, reader, writer, from_edge, initial_buf, client_id=None):
         async def forward(data):
             if from_edge:
                 # Edge -> all clients
-                for q in list(self.client_queues.values()): 
-                    q.put_nowait(data)
+                for q in list(self.client_queues.values()):
+                    try:
+                        q.put_nowait(data)
+                    except Exception:
+                        pass
             else:
                 # Client -> edge (only if this is the active client)
-                if writer != self.active_client:
-                    return  # Ignore inactive clients
+                if self.active_client_id != client_id:
+                    # Silent drop - this is an old client
+                    return
                 if self.edge_queue:
-                    self.edge_queue.put_nowait(data)
+                    try:
+                        self.edge_queue.put_nowait(data)
+                    except Exception:
+                        pass
         
         if initial_buf: 
             await forward(initial_buf)
         
         while True:
-            data = await reader.read(4096)
-            if not data: 
+            try:
+                data = await reader.read(4096)
+                if not data: 
+                    break
+                await forward(data)
+            except Exception as e:
+                log.error("Pump error: %s", e)
                 break
-            await forward(data)
 
 class Edge:
     def __init__(self, key: bytes, relay_host: str, relay_port: int, upstream_dns="1.1.1.1"):
         self.key = key
-        self.tunnel = None  # Will be created on each connection
+        self.tunnel = None
         self.relay_host = relay_host
         self.relay_port = relay_port
         self.upstream_dns = upstream_dns
@@ -430,7 +474,7 @@ class Edge:
     async def _run_once(self):
         reader, writer = await asyncio.open_connection(self.relay_host, self.relay_port)
         self.writer = writer
-        self.tunnel = AESTunnel(self.key)  # Fresh tunnel for new session
+        self.tunnel = AESTunnel(self.key)
         
         async with self._writer_lock:
             writer.write(encode_frame(control_msg("hello", {"role": "edge"})))
@@ -452,15 +496,16 @@ class Edge:
                     m_type, d_dict = parse_control_msg(f)
                     if m_type == "hello":
                         log.info("Edge: New client session, resetting tunnel")
-                        self.tunnel = AESTunnel(self.key)  # Reset encryption
-                        await self._close_all_tcp()  # Close old connections
+                        self.tunnel = AESTunnel(self.key)
+                        await self._close_all_tcp()
                         continue
                     
                     # Decrypt and handle message
                     try:
                         msg = self.tunnel.decrypt(f)
                     except Exception as e:
-                        log.error("Edge decrypt failed (len=%d): %s", len(f), e)
+                        log.error("Edge decrypt failed (len=%d, first 16 bytes: %s): %s", 
+                                 len(f), f[:16].hex() if len(f) >= 16 else f.hex(), e)
                         continue
                     
                     if msg.startswith(b"DNS"):
@@ -471,8 +516,12 @@ class Edge:
                             asyncio.create_task(self._tcp_init(cid, payload))
                         elif opcode == TCP_DATA and cid in self._tcp_conns:
                             c = self._tcp_conns[cid]
-                            c["w"].write(payload)
-                            await c["w"].drain()
+                            try:
+                                c["w"].write(payload)
+                                await c["w"].drain()
+                            except Exception as e:
+                                log.error("Edge TCP write error: %s", e)
+                                await self._close_tcp(cid)
                         elif opcode in (TCP_CLOSE, TCP_ERR):
                             await self._close_tcp(cid)
         finally:
@@ -483,11 +532,12 @@ class Edge:
     async def _handle_dns(self, tag, q):
         try:
             resp = await self._resolve_dns(q)
-            async with self._writer_lock:
-                self.writer.write(encode_frame(
-                    self.tunnel.encrypt(b"DNS" + tag + resp)
-                ))
-                await self.writer.drain()
+            if self.writer:
+                async with self._writer_lock:
+                    self.writer.write(encode_frame(
+                        self.tunnel.encrypt(b"DNS" + tag + resp)
+                    ))
+                    await self.writer.drain()
         except Exception as e:
             log.error("DNS resolution failed: %s", e)
 
@@ -524,11 +574,12 @@ class Edge:
             log.info("Edge: Opening TCP to %s:%s", host, port)
             r, w = await asyncio.wait_for(asyncio.open_connection(host, port), 30)
             
-            async with self._writer_lock:
-                self.writer.write(encode_frame(
-                    self.tunnel.encrypt(b"TCP" + bytes([TCP_READY]) + cid)
-                ))
-                await self.writer.drain()
+            if self.writer:
+                async with self._writer_lock:
+                    self.writer.write(encode_frame(
+                        self.tunnel.encrypt(b"TCP" + bytes([TCP_READY]) + cid)
+                    ))
+                    await self.writer.drain()
             
             self._tcp_conns[cid] = {"r": r, "w": w}
             
@@ -538,28 +589,42 @@ class Edge:
                         data = await r.read(4096)
                         if not data: 
                             break
-                        async with self._writer_lock:
-                            self.writer.write(encode_frame(
-                                self.tunnel.encrypt(b"TCP" + bytes([TCP_DATA]) + cid + data)
-                            ))
-                            await self.writer.drain()
+                        if self.writer:
+                            async with self._writer_lock:
+                                self.writer.write(encode_frame(
+                                    self.tunnel.encrypt(b"TCP" + bytes([TCP_DATA]) + cid + data)
+                                ))
+                                await self.writer.drain()
+                except Exception as e:
+                    log.error("Edge TCP pipe error: %s", e)
                 finally:
-                    async with self._writer_lock:
-                        self.writer.write(encode_frame(
-                            self.tunnel.encrypt(b"TCP" + bytes([TCP_CLOSE]) + cid)
-                        ))
-                        await self.writer.drain()
+                    if self.writer:
+                        try:
+                            async with self._writer_lock:
+                                self.writer.write(encode_frame(
+                                    self.tunnel.encrypt(b"TCP" + bytes([TCP_CLOSE]) + cid)
+                                ))
+                                await self.writer.drain()
+                        except Exception:
+                            pass
                     await self._close_tcp(cid)
             
             asyncio.create_task(pipe())
             
         except Exception as e:
-            log.error("Edge TCP init failed: %s", e)
-            async with self._writer_lock:
-                self.writer.write(encode_frame(
-                    self.tunnel.encrypt(b"TCP" + bytes([TCP_ERR]) + cid)
-                ))
-                await self.writer.drain()
+            log.error("Edge TCP init failed for %s:%s: %s", 
+                     payload[1:1+payload[0]].decode() if len(payload) > 0 else "unknown",
+                     int.from_bytes(payload[1+payload[0]:3+payload[0]], "big") if len(payload) > 2 else 0,
+                     e)
+            if self.writer:
+                try:
+                    async with self._writer_lock:
+                        self.writer.write(encode_frame(
+                            self.tunnel.encrypt(b"TCP" + bytes([TCP_ERR]) + cid)
+                        ))
+                        await self.writer.drain()
+                except Exception:
+                    pass
 
     async def _close_tcp(self, cid):
         c = self._tcp_conns.pop(cid, None)
