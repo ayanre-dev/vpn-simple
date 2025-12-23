@@ -141,6 +141,10 @@ class Client:
             self._read_task = asyncio.create_task(self._read_loop())
             log.info("Client connected to relay")
 
+    async def close(self):
+        """Public method to close the client connection."""
+        await self._cleanup()
+
     async def _read_loop(self):
         buf = bytearray()
         try:
@@ -751,4 +755,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

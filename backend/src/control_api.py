@@ -107,6 +107,7 @@ async def connect():
             else:
                 key = load_key(key_file)
                 client = Client(key, relay_host, relay_port)
+            await client.connect()
             await _set_client(client, True, None)
             await _ensure_dns_forwarder(client, dns_listen_host, dns_listen_port)
             await _ensure_socks_proxy(client, socks_listen_host, socks_listen_port)
