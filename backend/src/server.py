@@ -148,7 +148,7 @@ class Client:
                     try:
                         msg = self.tunnel.decrypt(f)
                     except Exception as e:
-                        log.error("Client decrypt failed: %s", e)
+                        log.error("Client decrypt failed (len=%d, start=%s): %s", len(f), f[:16].hex(), e)
                         continue
                     
                     if msg.startswith(b"DNS"):
@@ -307,6 +307,7 @@ class Relay:
         self.port = port
         self.tunnel = AESTunnel(key)
         self.edge_writer: Optional[asyncio.StreamWriter] = None
+        self.edge_writer_lock = asyncio.Lock()
         self.clients: set[asyncio.StreamWriter] = set()
         self.client_locks: dict[asyncio.StreamWriter, asyncio.Lock] = {}
 
@@ -321,17 +322,20 @@ class Relay:
         buf = bytearray()
         try:
             # Expect first frame as plaintext control msg
-            data = await reader.readexactly(4)
-            buf.extend(data)
-            frames = decode_frames(buf)
-            while not frames:
+            while True:
                 chunk = await reader.read(4096)
                 if not chunk:
                     return
                 buf.extend(chunk)
                 frames = decode_frames(buf)
-            hello = frames[0]
-            msg_type, data = parse_control_msg(hello)
+                if frames:
+                    hello_frame = frames[0]
+                    # Any remaining frames in 'frames[1:]' and remaining bytes in 'buf'
+                    # must be preserved and forwarded after role identifies.
+                    pending_frames = frames[1:]
+                    break
+            
+            msg_type, data = parse_control_msg(hello_frame)
             if msg_type != "hello" or "role" not in data:
                 log.warning("Relay: bad hello from %s", peer)
                 writer.close()
@@ -340,13 +344,21 @@ class Relay:
             role = data["role"]
             log.info("Relay: %s connected from %s", role, peer)
 
+            # Re-assemble initial data: any trailing bytes in buf + pending frames
+            # Note: pending_frames are already decrypted/extracted payloads, 
+            # we must re-frame them for the pump.
+            initial_data = bytearray()
+            for f in pending_frames:
+                initial_data.extend(encode_frame(f))
+            initial_data.extend(buf)
+
             if role == "edge":
                 self.edge_writer = writer
-                await self._pump(reader, writer, from_edge=True, initial_buf=buf)
+                await self._pump(reader, writer, from_edge=True, initial_buf=initial_data)
             elif role == "client":
                 self.clients.add(writer)
                 self.client_locks[writer] = asyncio.Lock()
-                await self._pump(reader, writer, from_edge=False, initial_buf=buf)
+                await self._pump(reader, writer, from_edge=False, initial_buf=initial_data)
             else:
                 log.warning("Relay: unknown role %s from %s", role, peer)
                 writer.close()
@@ -368,9 +380,8 @@ class Relay:
     async def _pump(self, reader, writer, from_edge: bool, initial_buf: bytearray = None):
         """
         Pass-through pump with background writing for clients to avoid head-of-line blocking.
-        Ordering is preserved per-client via a lock.
         """
-        async def safe_write(cw, chunk):
+        async def safe_write_client(cw, chunk):
             lock = self.client_locks.get(cw)
             if not lock: return
             async with lock:
@@ -381,14 +392,21 @@ class Relay:
                     self.clients.discard(cw)
                     self.client_locks.pop(cw, None)
 
-        if initial_buf:
+        async def safe_write_edge(chunk):
+            if not self.edge_writer: return
+            async with self.edge_writer_lock:
+                try:
+                    self.edge_writer.write(chunk)
+                    await self.edge_writer.drain()
+                except Exception:
+                    self.edge_writer = None
+
+        if initial_buf and len(initial_buf) > 0:
             if from_edge:
                 for cw in list(self.clients):
-                    asyncio.create_task(safe_write(cw, initial_buf))
+                    asyncio.create_task(safe_write_client(cw, initial_buf))
             else:
-                if self.edge_writer:
-                    self.edge_writer.write(initial_buf)
-                    await self.edge_writer.drain()
+                await safe_write_edge(initial_buf)
 
         while True:
             data = await reader.read(4096)
@@ -396,11 +414,9 @@ class Relay:
                 break
             if from_edge:
                 for cw in list(self.clients):
-                    asyncio.create_task(safe_write(cw, data))
+                    asyncio.create_task(safe_write_client(cw, data))
             else:
-                if self.edge_writer:
-                    self.edge_writer.write(data)
-                    await self.edge_writer.drain()
+                await safe_write_edge(data)
         # end
 
 
@@ -468,7 +484,7 @@ class Edge:
                     try:
                         msg = self.tunnel.decrypt(f)
                     except Exception as e:
-                        log.error("Edge decrypt failed: %s", e)
+                        log.error("Edge decrypt failed (len=%d, start=%s): %s", len(f), f[:16].hex(), e)
                         continue
                     # DNS
                     if msg.startswith(b"DNS"):
