@@ -109,22 +109,15 @@ async def _reconnect_loop():
                 
                 # Update global state
                 async with _state_lock:
-                    old_client = _client
-                    _client = client
-                    await _set_client(client, True, None)
-                    
-                    # Update proxy references
-                    if _dns_forwarder:
-                        _dns_forwarder.update_client(client)
-                    if _socks_proxy:
-                        _socks_proxy.update_client(client)
-                    
                     # Clean up old client
                     if old_client:
                         try:
                             await old_client.close()
                         except Exception:
                             pass
+                    
+                    _client = client
+                    await _set_client(client, True, None)
                 
                 log.info("Reconnected successfully")
             

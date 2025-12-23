@@ -51,9 +51,11 @@ def enable_keepalive(sock: socket.socket):
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
         
         # Windows uses different settings
-        if os.name == 'nt':
+        if os.name == 'nt' and hasattr(sock, 'ioctl'):
             # (on_off, idle_time_ms, interval_ms)
             sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 30000, 10000))
+        elif os.name == 'nt':
+            log.debug("Socket lacks ioctl, skipping SIO_KEEPALIVE_VALS")
         
         log.debug("TCP keepalive enabled on socket")
     except Exception as e:
@@ -439,12 +441,17 @@ class Relay:
                 self._client_id_counter += 1
                 client_id = self._client_id_counter
                 
-                # Close old client gracefully
+                # Close old client gracefully and forcefully
                 if self.active_client and self.active_client != writer:
                     log.info("Relay: New client %d, old client will be replaced", client_id)
-                    old_queue = self.client_queues.pop(self.active_client, None)
+                    old_writer = self.active_client
+                    old_queue = self.client_queues.pop(old_writer, None)
                     if old_queue:
                         old_queue.put_nowait(None)
+                    try:
+                        old_writer.close()
+                    except Exception:
+                        pass
                 
                 self.active_client = writer
                 self.active_client_id = client_id
@@ -500,10 +507,10 @@ class Relay:
     async def _pump(self, reader, writer, from_edge, initial_buf, client_id=None):
         async def forward(data):
             if from_edge:
-                # Edge -> all clients
-                for q in list(self.client_queues.values()):
+                # Edge -> ONLY the active client
+                if self.active_client and self.active_client in self.client_queues:
                     try:
-                        q.put_nowait(data)
+                        self.client_queues[self.active_client].put_nowait(data)
                     except Exception:
                         pass
             else:
@@ -520,6 +527,11 @@ class Relay:
             await forward(initial_buf)
         
         while True:
+            # If this is a client pump, and it's no longer the active client, exit
+            if not from_edge and client_id is not None and self.active_client_id != client_id:
+                log.info("Relay: Client %d pump stopping (no longer active)", client_id)
+                break
+
             try:
                 data = await reader.read(4096)
                 if not data: 
