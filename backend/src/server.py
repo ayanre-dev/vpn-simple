@@ -14,10 +14,14 @@ log = get_logger("server")
 def encode_frame(payload: bytes) -> bytes:
     return len(payload).to_bytes(4, "big") + payload
 
-def decode_frames(buf: bytearray) -> list[bytes]:
+def decode_frames(buf: bytearray, max_size: int = 256 * 1024) -> list[bytes]:
     frames = []
     while len(buf) >= 4:
         ln = int.from_bytes(buf[:4], "big")
+        if ln > max_size:
+            log.error("Frame too large (%d bytes), clearing buffer", ln)
+            buf.clear()
+            break
         if len(buf) < 4 + ln:
             break
         frames.append(bytes(buf[4 : 4 + ln]))
@@ -520,41 +524,53 @@ class Relay:
             except Exception: 
                 pass
 
-    async def _pump(self, reader, writer, from_edge, initial_buf, client_id=None):
-        async def forward(data):
-            if from_edge:
-                # Edge -> ONLY the active client
-                if self.active_client and self.active_client in self.client_queues:
-                    try:
-                        self.client_queues[self.active_client].put_nowait(data)
-                    except Exception:
-                        pass
-            else:
-                # Client -> edge (only if this is the active client)
-                if self.active_client_id != client_id:
-                    return
-                if self.edge_queue:
-                    try:
-                        self.edge_queue.put_nowait(data)
-                    except Exception:
-                        pass
-        
-        if initial_buf: 
-            await forward(initial_buf)
-        
+    async def _pump(self, reader, writer, from_edge, initial_data, client_id=None):
+        buf = bytearray()
+        if initial_data:
+            buf.extend(initial_data)
+
+        async def forward_frames():
+            frames = decode_frames(buf)
+            for f in frames:
+                data = encode_frame(f)
+                if from_edge:
+                    # Edge -> ONLY the active client
+                    if self.active_client and self.active_client in self.client_queues:
+                        try:
+                            self.client_queues[self.active_client].put_nowait(data)
+                        except Exception:
+                            pass
+                else:
+                    # Client -> edge (only if this is the active client)
+                    if self.active_client_id != client_id:
+                        return False # Stop pumping
+                    if self.edge_queue:
+                        try:
+                            self.edge_queue.put_nowait(data)
+                        except Exception:
+                            pass
+            return True
+
+        if len(buf) > 0:
+            if not await forward_frames():
+                return
+
         while True:
-            # If this is a client pump, and it's no longer the active client, exit
+            # Check if this client pump should stop
             if not from_edge and client_id is not None and self.active_client_id != client_id:
                 log.info("Relay: Client %d pump stopping (no longer active)", client_id)
                 break
 
             try:
-                data = await reader.read(4096)
-                if not data: 
+                chunk = await reader.read(4096)
+                if not chunk: 
                     break
-                await forward(data)
+                
+                buf.extend(chunk)
+                if not await forward_frames():
+                    break
             except Exception as e:
-                log.error("Pump error: %s", e)
+                log.error("Relay pump error: %s", e)
                 break
 
 class Edge:
@@ -607,10 +623,11 @@ class Edge:
                     # Check if it's a control message (new client hello)
                     m_type, d_dict = parse_control_msg(f)
                     if m_type == "hello":
-                        log.info("Edge: New client session, resetting tunnel")
+                        log.info("Edge: New client session, resetting tunnel and clearing buffer")
                         self.tunnel = AESTunnel(self.key)
                         await self._close_all_tcp()
-                        continue
+                        buf.clear() # Throw away any stale encrypted data
+                        break # Stop processing frames from the OLD buffer
                     
                     # Decrypt and handle message
                     try:
