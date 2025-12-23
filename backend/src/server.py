@@ -301,18 +301,46 @@ def load_key(path: str) -> bytes:
     log.warning("IMPORTANT: If you are running multiple PCs, YOU MUST COPY THIS FILE TO ALL MACHINES.")
     return key
 
+class AESTunnel:
+    def __init__(self, key: bytes):
+        self.key = key
+        self.enc_nonce = 0
+        self.dec_nonce = 0
+
+    def reset(self):
+        """Reset nonces to 0 for a new session."""
+        self.enc_nonce = 0
+        self.dec_nonce = 0
+        log.info("AESTunnel: nonces reset to 0")
+
+    def encrypt(self, plaintext: bytes) -> bytes:
+        nonce = self.enc_nonce.to_bytes(12, "big")
+        aesgcm = AESGCM(self.key)
+        self.enc_nonce += 1
+        return aesgcm.encrypt(nonce, plaintext, None)
+
+    def decrypt(self, ciphertext: bytes) -> bytes:
+        nonce = self.dec_nonce.to_bytes(12, "big")
+        aesgcm = AESGCM(self.key)
+        self.dec_nonce += 1
+        return aesgcm.decrypt(nonce, ciphertext, None)
+
+# ... (rest of helper functions unchanged)
+
 class Relay:
     """
     Simple relay: one or more clients, one edge.
     First frame must be a plaintext control hello with role.
     All subsequent payloads are framed; relay forwards frames between client(s) and edge.
     Uses per-client queues to guarantee packet ordering without head-of-line blocking.
+    ENFORCES ONE CLIENT AT A TIME for session synchronization.
     """
     def __init__(self, key: bytes, host: str, port: int):
         self.host = host
         self.port = port
         self.tunnel = AESTunnel(key)
         self.edge_queue: Optional[asyncio.Queue] = None
+        self.active_client: Optional[asyncio.StreamWriter] = None
         self.clients: dict[asyncio.StreamWriter, asyncio.Queue] = {}
 
     async def start(self):
@@ -364,6 +392,21 @@ class Relay:
             queue = asyncio.Queue(maxsize=1000)
             writer_task = asyncio.create_task(self._writer_task(writer, queue, f"{role}@{peer}"))
 
+            if role == "client":
+                # ENFORCE SINGLE CLIENT: Discard old ones.
+                if self.active_client and self.active_client in self.clients:
+                    log.info("Relay: disconnecting stale client to start new session")
+                    old_q = self.clients.pop(self.active_client)
+                    old_q.put_nowait(None) 
+                
+                self.active_client = writer
+                self.clients[writer] = queue
+                
+                # FORWARD HELLO to Edge to trigger session reset
+                if self.edge_queue:
+                    log.info("Relay: forwarding hello to Edge for session sync")
+                    self.edge_queue.put_nowait(encode_frame(hello_frame))
+
             # Re-assemble initial data: any trailing bytes in buf + pending frames
             initial_data = bytearray()
             for f in pending_frames:
@@ -375,9 +418,10 @@ class Relay:
                 await self._pump(reader, writer, from_edge=True, initial_buf=initial_data)
                 self.edge_queue = None
             elif role == "client":
-                self.clients[writer] = queue
                 await self._pump(reader, writer, from_edge=False, initial_buf=initial_data)
                 self.clients.pop(writer, None)
+                if self.active_client is writer:
+                    self.active_client = None
             else:
                 log.warning("Relay: unknown role %s from %s", role, peer)
 
@@ -397,6 +441,7 @@ class Relay:
         
         async def forward(data):
             if from_edge:
+                # Still broadcast to all (normally just one), but prioritize active
                 for cw, q in list(self.clients.items()):
                     try:
                         q.put_nowait(data)
@@ -483,6 +528,16 @@ class Edge:
                 buf.extend(data)
                 frames = decode_frames(buf)
                 for f in frames:
+                    # Check if it's a plaintext hello (role change or session reset)
+                    try:
+                        msg_type, data_dict = parse_control_msg(f)
+                        if msg_type == "hello":
+                            log.info("Edge: session reset by client hello (%s)", data_dict.get("role"))
+                            self.tunnel.reset()
+                            continue
+                    except Exception:
+                        pass
+
                     try:
                         msg = self.tunnel.decrypt(f)
                     except Exception as e:
