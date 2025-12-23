@@ -100,7 +100,8 @@ class Socks5Proxy:
                 conn = await self.client.open_tcp(host, port)
                 self.log.info("SOCKS: open_tcp ok %s:%s", host, port)
             except Exception as e:
-                self.log.exception("SOCKS: open_tcp failed %s:%s (%s)", host, port, e)
+                err_msg = str(e) or e.__class__.__name__
+                self.log.error("SOCKS: open_tcp failed %s:%s (%s)", host, port, err_msg)
                 writer.write(b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00")
                 await writer.drain()
                 writer.close()

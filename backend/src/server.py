@@ -50,10 +50,11 @@ def enable_keepalive(sock: socket.socket):
             # Linux: number of keepalive probes before giving up
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
         
-        # Windows uses different settings
+        # Windows uses different settings - more conservative to avoid Proactor issues
         if os.name == 'nt' and hasattr(sock, 'ioctl'):
             # (on_off, idle_time_ms, interval_ms)
-            sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 30000, 10000))
+            # Increased idle time to 60s
+            sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 60000, 10000))
         elif os.name == 'nt':
             log.debug("Socket lacks ioctl, skipping SIO_KEEPALIVE_VALS")
         
@@ -149,7 +150,10 @@ class Client:
         self._heartbeat_task = None
 
     def is_connected(self) -> bool:
-        return self._writer is not None and self._read_task is not None and not self._read_task.done()
+        return (self._writer is not None and 
+                not self._writer.is_closing() and
+                self._read_task is not None and 
+                not self._read_task.done())
 
     async def connect(self):
         async with self._conn_lock:
@@ -193,7 +197,7 @@ class Client:
         """Send periodic heartbeat to keep connection alive."""
         try:
             while True:
-                await asyncio.sleep(10)  # Every 10 seconds
+                await asyncio.sleep(5)  # More frequent for Ngrok (5s)
                 if self.is_connected():
                     try:
                         # Send a small encrypted ping message
@@ -342,6 +346,12 @@ class Client:
             self._tcp_conns.pop(cid, None)
             log.error("Failed to open TCP to %s:%s: Timeout waiting for Edge", host, port)
             raise ConnectionError(f"Timeout connecting to {host}:{port}")
+        except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
+            self._tcp_conns.pop(cid, None)
+            log.error("Relay connection lost during open_tcp to %s:%s", host, port)
+            if self._read_task and not self._read_task.done():
+                self._read_task.cancel() # Force reconnect
+            raise
         except Exception as e:
             self._tcp_conns.pop(cid, None)
             err_msg = str(e) or e.__class__.__name__
