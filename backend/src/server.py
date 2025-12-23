@@ -34,6 +34,31 @@ def parse_control_msg(payload: bytes) -> tuple[str, dict]:
     except Exception:
         return None, {}
 
+def enable_keepalive(sock: socket.socket):
+    """Enable TCP keepalive on a socket to prevent connection drops."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        
+        # Platform-specific keepalive settings
+        if hasattr(socket, 'TCP_KEEPIDLE'):
+            # Linux: time before sending keepalive probes (seconds)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+        if hasattr(socket, 'TCP_KEEPINTVL'):
+            # Linux: interval between keepalive probes (seconds)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+        if hasattr(socket, 'TCP_KEEPCNT'):
+            # Linux: number of keepalive probes before giving up
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        
+        # Windows uses different settings
+        if os.name == 'nt':
+            # (on_off, idle_time_ms, interval_ms)
+            sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 30000, 10000))
+        
+        log.debug("TCP keepalive enabled on socket")
+    except Exception as e:
+        log.warning("Failed to enable keepalive: %s", e)
+
 # TCP opcodes
 TCP_INIT = 0
 TCP_READY = 1
@@ -60,7 +85,7 @@ def load_key(path: str) -> bytes:
 
 class AESTunnel:
     """
-    FIXED: Uses random nonces prepended to ciphertext instead of sequential counters.
+    Uses random nonces prepended to ciphertext instead of sequential counters.
     This prevents nonce desynchronization issues.
     """
     def __init__(self, key: bytes):
@@ -119,7 +144,7 @@ class Client:
         self._tcp_conns: Dict[bytes, ClientTCPConnection] = {}
         self._dns_futures: Dict[int, asyncio.Future] = {}
         self._dns_tag_counter = 0
-        self._reconnect_task = None
+        self._heartbeat_task = None
 
     def is_connected(self) -> bool:
         return self._writer is not None and self._read_task is not None and not self._read_task.done()
@@ -134,6 +159,14 @@ class Client:
                     asyncio.open_connection(self.relay_host, self.relay_port, ssl=_maybe_tls()),
                     timeout=10
                 )
+                
+                # Enable TCP keepalive
+                sock = writer.get_extra_info('socket')
+                if sock:
+                    enable_keepalive(sock)
+                    # Also disable Nagle's algorithm for lower latency
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    
             except Exception as e:
                 log.error("Failed to connect to relay: %s", e)
                 raise
@@ -151,17 +184,38 @@ class Client:
                 await writer.drain()
             
             self._read_task = asyncio.create_task(self._read_loop())
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
             log.info("Client connected to relay at %s:%s", self.relay_host, self.relay_port)
+
+    async def _heartbeat_loop(self):
+        """Send periodic heartbeat to keep connection alive."""
+        try:
+            while True:
+                await asyncio.sleep(10)  # Every 10 seconds
+                if self.is_connected():
+                    try:
+                        # Send a small encrypted ping message
+                        async with self._writer_lock:
+                            self._writer.write(encode_frame(
+                                self.tunnel.encrypt(b"PING")
+                            ))
+                            await self._writer.drain()
+                        log.debug("Heartbeat sent")
+                    except Exception as e:
+                        log.error("Heartbeat failed: %s", e)
+                        break
+        except asyncio.CancelledError:
+            pass
 
     async def _read_loop(self):
         buf = bytearray()
         try:
             while True:
                 try:
-                    data = await asyncio.wait_for(self._reader.read(4096), timeout=60)
+                    data = await asyncio.wait_for(self._reader.read(4096), timeout=120)
                 except asyncio.TimeoutError:
-                    # Heartbeat check - connection still alive
-                    continue
+                    log.warning("Read timeout - connection may be dead")
+                    break
                     
                 if not data: 
                     log.warning("Client connection closed by relay")
@@ -174,6 +228,11 @@ class Client:
                     except Exception as e:
                         log.error("Client decrypt failed (len=%d, first 16 bytes: %s): %s", 
                                  len(f), f[:16].hex() if len(f) >= 16 else f.hex(), e)
+                        continue
+                    
+                    # Ignore heartbeat responses
+                    if msg == b"PONG":
+                        log.debug("Heartbeat response received")
                         continue
                     
                     if msg.startswith(b"DNS"):
@@ -200,6 +259,15 @@ class Client:
             await self._cleanup()
 
     async def _cleanup(self):
+        # Stop heartbeat
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            self._heartbeat_task = None
+        
         if self._writer:
             try: 
                 self._writer.close()
@@ -335,6 +403,13 @@ class Relay:
 
     async def _handle_conn(self, reader, writer):
         peer = writer.get_extra_info("peername")
+        
+        # Enable keepalive on relay connections
+        sock = writer.get_extra_info('socket')
+        if sock:
+            enable_keepalive(sock)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        
         buf = bytearray()
         
         try:
@@ -364,15 +439,18 @@ class Relay:
                 self._client_id_counter += 1
                 client_id = self._client_id_counter
                 
-                # DON'T close old client immediately - let it drain naturally
+                # Close old client gracefully
                 if self.active_client and self.active_client != writer:
                     log.info("Relay: New client %d, old client will be replaced", client_id)
+                    old_queue = self.client_queues.pop(self.active_client, None)
+                    if old_queue:
+                        old_queue.put_nowait(None)
                 
                 self.active_client = writer
                 self.active_client_id = client_id
                 self.client_queues[writer] = queue
                 
-                # Drain edge queue only if edge exists
+                # Drain edge queue
                 if self.edge_queue:
                     count = 0
                     while not self.edge_queue.empty():
@@ -431,7 +509,6 @@ class Relay:
             else:
                 # Client -> edge (only if this is the active client)
                 if self.active_client_id != client_id:
-                    # Silent drop - this is an old client
                     return
                 if self.edge_queue:
                     try:
@@ -473,6 +550,13 @@ class Edge:
 
     async def _run_once(self):
         reader, writer = await asyncio.open_connection(self.relay_host, self.relay_port)
+        
+        # Enable keepalive on edge connection
+        sock = writer.get_extra_info('socket')
+        if sock:
+            enable_keepalive(sock)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        
         self.writer = writer
         self.tunnel = AESTunnel(self.key)
         
@@ -506,6 +590,14 @@ class Edge:
                     except Exception as e:
                         log.error("Edge decrypt failed (len=%d, first 16 bytes: %s): %s", 
                                  len(f), f[:16].hex() if len(f) >= 16 else f.hex(), e)
+                        continue
+                    
+                    # Ignore heartbeat pings
+                    if msg == b"PING":
+                        log.debug("Heartbeat received, sending PONG")
+                        async with self._writer_lock:
+                            self.writer.write(encode_frame(self.tunnel.encrypt(b"PONG")))
+                            await self.writer.drain()
                         continue
                     
                     if msg.startswith(b"DNS"):
@@ -574,6 +666,12 @@ class Edge:
             log.info("Edge: Opening TCP to %s:%s", host, port)
             r, w = await asyncio.wait_for(asyncio.open_connection(host, port), 30)
             
+            # Enable keepalive on outbound connections too
+            sock = w.get_extra_info('socket')
+            if sock:
+                enable_keepalive(sock)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            
             if self.writer:
                 async with self._writer_lock:
                     self.writer.write(encode_frame(
@@ -612,10 +710,7 @@ class Edge:
             asyncio.create_task(pipe())
             
         except Exception as e:
-            log.error("Edge TCP init failed for %s:%s: %s", 
-                     payload[1:1+payload[0]].decode() if len(payload) > 0 else "unknown",
-                     int.from_bytes(payload[1+payload[0]:3+payload[0]], "big") if len(payload) > 2 else 0,
-                     e)
+            log.error("Edge TCP init failed: %s", e)
             if self.writer:
                 try:
                     async with self._writer_lock:
