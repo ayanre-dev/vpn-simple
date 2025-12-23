@@ -7,7 +7,7 @@ from dnslib import DNSRecord, RCODE
 from backend.src.logger import get_logger
 from backend.src.server import Client, load_key
 from backend.src.dns_forwarder import DNSForwarder, DNSForwarderState
-from backend.src.socks5_proxy import Socks5Proxy, Socks5State  # new
+from backend.src.socks5_proxy import Socks5Proxy, Socks5State
 from fastapi.middleware.cors import CORSMiddleware
 
 
@@ -16,7 +16,7 @@ app = FastAPI(title="VPN Simple Control API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # or restrict to your dev origin
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -35,6 +35,8 @@ _connected: bool = False
 _last_error: str | None = None
 _dns_forwarder: DNSForwarder | None = None
 _socks_proxy: Socks5Proxy | None = None
+_reconnect_task: asyncio.Task | None = None
+_should_stay_connected: bool = False
 
 def _config():
     relay_host = os.environ.get("RELAY_HOST", "127.0.0.1")
@@ -81,6 +83,58 @@ async def _stop_socks_proxy():
         await _socks_proxy.stop()
         _socks_proxy = None
 
+async def _reconnect_loop():
+    """Keep the client connection alive, reconnecting if needed."""
+    global _client, _should_stay_connected
+    
+    (relay_host, relay_port, key_file, dns_query,
+     dns_listen_host, dns_listen_port, socks_listen_host, socks_listen_port) = _config()
+    
+    # Prefer handshake-only mode when EDGE_PUBKEY_FILE is configured
+    edge_pub = os.environ.get("EDGE_PUBKEY_FILE")
+    if edge_pub and os.path.exists(edge_pub):
+        key = None
+    else:
+        key = load_key(key_file)
+    
+    while _should_stay_connected:
+        try:
+            # Check if client is still connected
+            if not _client or not _client.is_connected():
+                log.info("Reconnecting to relay...")
+                
+                # Create new client
+                client = Client(key, relay_host, relay_port)
+                await client.connect()
+                
+                # Update global state
+                async with _state_lock:
+                    old_client = _client
+                    _client = client
+                    await _set_client(client, True, None)
+                    
+                    # Update proxy references
+                    if _dns_forwarder:
+                        _dns_forwarder.update_client(client)
+                    if _socks_proxy:
+                        _socks_proxy.update_client(client)
+                    
+                    # Clean up old client
+                    if old_client:
+                        try:
+                            await old_client.close()
+                        except Exception:
+                            pass
+                
+                log.info("Reconnected successfully")
+            
+            # Wait before checking again
+            await asyncio.sleep(5)
+            
+        except Exception as e:
+            log.error("Reconnect loop error: %s", e)
+            await asyncio.sleep(2)
+
 @app.get("/status", response_model=StatusResponse)
 async def status():
     relay_host, relay_port, _, dns_query, *_rest = _config()
@@ -94,40 +148,112 @@ async def status():
 
 @app.post("/connect", response_model=StatusResponse)
 async def connect():
+    global _reconnect_task, _should_stay_connected
+    
     async with _state_lock:
         (relay_host, relay_port, key_file, dns_query,
          dns_listen_host, dns_listen_port, socks_listen_host, socks_listen_port) = _config()
-        if _client and _client.is_connected():
-            return StatusResponse(connected=True, relay_host=relay_host, relay_port=relay_port, dns_query=dns_query, error=None)
+        
+        # If already connected and reconnect loop is running, just return status
+        if _client and _client.is_connected() and _reconnect_task and not _reconnect_task.done():
+            log.info("Already connected to relay")
+            return StatusResponse(
+                connected=True, 
+                relay_host=relay_host, 
+                relay_port=relay_port, 
+                dns_query=dns_query, 
+                error=None
+            )
+        
         try:
-            # Prefer handshake-only mode when EDGE_PUBKEY_FILE is configured
+            # Stop old reconnect task if exists
+            if _reconnect_task and not _reconnect_task.done():
+                _should_stay_connected = False
+                _reconnect_task.cancel()
+                try:
+                    await _reconnect_task
+                except asyncio.CancelledError:
+                    pass
+            
+            # Create initial connection
             edge_pub = os.environ.get("EDGE_PUBKEY_FILE")
             if edge_pub and os.path.exists(edge_pub):
                 client = Client(None, relay_host, relay_port)
             else:
                 key = load_key(key_file)
                 client = Client(key, relay_host, relay_port)
+            
             await client.connect()
             await _set_client(client, True, None)
+            
+            # Start DNS forwarder and SOCKS proxy
             await _ensure_dns_forwarder(client, dns_listen_host, dns_listen_port)
             await _ensure_socks_proxy(client, socks_listen_host, socks_listen_port)
-
-            return StatusResponse(connected=True, relay_host=relay_host, relay_port=relay_port, dns_query=dns_query, error=None)
-        except Exception as e:  # noqa: BLE001
+            
+            # Start reconnect loop to maintain connection
+            _should_stay_connected = True
+            _reconnect_task = asyncio.create_task(_reconnect_loop())
+            
+            log.info("Connected to relay and started reconnect loop")
+            return StatusResponse(
+                connected=True, 
+                relay_host=relay_host, 
+                relay_port=relay_port, 
+                dns_query=dns_query, 
+                error=None
+            )
+            
+        except Exception as e:
             log.exception("Connect failed")
             await _set_client(None, False, str(e))
             await _stop_dns_forwarder()
             await _stop_socks_proxy()
-            return StatusResponse(connected=False, relay_host=relay_host, relay_port=relay_port, dns_query=dns_query, error=str(e))
+            _should_stay_connected = False
+            return StatusResponse(
+                connected=False, 
+                relay_host=relay_host, 
+                relay_port=relay_port, 
+                dns_query=dns_query, 
+                error=str(e)
+            )
 
 @app.post("/disconnect")
 async def disconnect():
+    global _reconnect_task, _should_stay_connected
+    
     async with _state_lock:
         try:
+            # Stop reconnect loop
+            _should_stay_connected = False
+            if _reconnect_task and not _reconnect_task.done():
+                _reconnect_task.cancel()
+                try:
+                    await _reconnect_task
+                except asyncio.CancelledError:
+                    pass
+            _reconnect_task = None
+            
+            # Stop services
             await _stop_dns_forwarder()
             await _stop_socks_proxy()
+            
+            # Close client
             if _client and hasattr(_client, "close"):
                 await _client.close()
         finally:
             await _set_client(None, False, None)
+    
+    log.info("Disconnected from relay")
     return {"disconnected": True}
+
+@app.on_event("shutdown")
+async def shutdown():
+    """Clean up on application shutdown."""
+    global _should_stay_connected
+    _should_stay_connected = False
+    if _reconnect_task:
+        _reconnect_task.cancel()
+    await _stop_dns_forwarder()
+    await _stop_socks_proxy()
+    if _client:
+        await _client.close()
