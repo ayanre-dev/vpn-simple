@@ -41,6 +41,11 @@ class Socks5Proxy:
             t.cancel()
         self._tasks.clear()
 
+    def update_client(self, client):
+        """Update the client reference for new sessions."""
+        self.client = client
+        self.log.info("SOCKS5: client reference updated")
+
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         addr = writer.get_extra_info("peername")
         self.log.info("SOCKS: new client %s", addr)

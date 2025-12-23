@@ -107,8 +107,18 @@ async def connect():
                 key = load_key(key_file)
                 client = Client(key, relay_host, relay_port)
             await _set_client(client, True, None)
-            await _ensure_dns_forwarder(client, dns_listen_host, dns_listen_port)
-            await _ensure_socks_proxy(client, socks_listen_host, socks_listen_port)
+            
+            # Sync references if already running
+            if _dns_forwarder:
+                _dns_forwarder.update_client(client)
+            else:
+                await _ensure_dns_forwarder(client, dns_listen_host, dns_listen_port)
+                
+            if _socks_proxy:
+                _socks_proxy.update_client(client)
+            else:
+                await _ensure_socks_proxy(client, socks_listen_host, socks_listen_port)
+
             return StatusResponse(connected=True, relay_host=relay_host, relay_port=relay_port, dns_query=dns_query, error=None)
         except Exception as e:  # noqa: BLE001
             log.exception("Connect failed")

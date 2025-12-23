@@ -34,6 +34,11 @@ class DNSForwarder(asyncio.DatagramProtocol):
         self.state = DNSForwarderState.STOPPED
         self.log.info("DNS forwarder stopped")
 
+    def update_client(self, client):
+        """Update the client reference for new sessions."""
+        self.client = client
+        self.log.info("DNS forwarder: client reference updated")
+
     def datagram_received(self, data: bytes, addr):
         asyncio.create_task(self.handle_query(data, addr))
 

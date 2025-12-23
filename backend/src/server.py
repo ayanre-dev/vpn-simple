@@ -389,7 +389,7 @@ class Relay:
             role = data["role"]
             log.info("Relay: %s connected from %s", role, peer)
 
-            queue = asyncio.Queue(maxsize=1000)
+            queue = asyncio.Queue()  # INFINITE QUEUE: Dropping packets is fatal for AES-GCM
             writer_task = asyncio.create_task(self._writer_task(writer, queue, f"{role}@{peer}"))
 
             if role == "client":
@@ -402,15 +402,15 @@ class Relay:
                 self.active_client = writer
                 self.client_queues[writer] = queue
                 
-                # CLEAR EDGE QUEUE to prevent stale packets from previous client sessions
                 if self.edge_queue:
+                    # Drain the queue: any packets from the PREVIOUS client must be gone
+                    # otherwise the Edge will try to decrypt them with the NEW nonces.
                     while not self.edge_queue.empty():
                         try:
                             self.edge_queue.get_nowait()
-                            self.edge_queue.task_done()
                         except (asyncio.QueueEmpty, ValueError):
                             break
-                    log.info("Relay: Edge queue cleared for new session")
+                    log.info("Relay: Edge queue drained for new session")
                     # FORWARD HELLO to Edge to trigger session reset
                     self.edge_queue.put_nowait(encode_frame(hello_frame))
 
