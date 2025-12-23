@@ -54,17 +54,14 @@ def enable_keepalive(sock: socket.socket):
             # Linux: number of keepalive probes before giving up
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
         
-        # Windows uses different settings - more conservative to avoid Proactor issues
+        # Windows uses different settings - just try and ignore if it fails
         if os.name == 'nt' and hasattr(sock, 'ioctl'):
-            # (on_off, idle_time_ms, interval_ms)
-            # Increased idle time to 60s
-            sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 60000, 10000))
-        elif os.name == 'nt':
-            log.debug("Socket lacks ioctl, skipping SIO_KEEPALIVE_VALS")
-        
-        log.debug("TCP keepalive enabled on socket")
-    except Exception as e:
-        log.warning("Failed to enable keepalive: %s", e)
+            try:
+                sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 60000, 30000))
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 # TCP opcodes
 TCP_INIT = 0
@@ -154,10 +151,7 @@ class Client:
         self._heartbeat_task = None
 
     def is_connected(self) -> bool:
-        return (self._writer is not None and 
-                not self._writer.is_closing() and
-                self._read_task is not None and 
-                not self._read_task.done())
+        return self._writer is not None and self._read_task is not None and not self._read_task.done()
 
     async def connect(self):
         async with self._conn_lock:
@@ -201,7 +195,7 @@ class Client:
         """Send periodic heartbeat to keep connection alive."""
         try:
             while True:
-                await asyncio.sleep(5)  # More frequent for Ngrok (5s)
+                await asyncio.sleep(20)  # More relaxed (20s)
                 if self.is_connected():
                     try:
                         # Send a small encrypted ping message
@@ -222,10 +216,9 @@ class Client:
         try:
             while True:
                 try:
-                    data = await asyncio.wait_for(self._reader.read(4096), timeout=120)
+                    data = await asyncio.wait_for(self._reader.read(4096), timeout=300) # Wait 5 mins
                 except asyncio.TimeoutError:
-                    log.warning("Read timeout - connection may be dead")
-                    break
+                    continue # Just keep trying
                     
                 if not data: 
                     log.warning("Client connection closed by relay")
@@ -340,7 +333,7 @@ class Client:
                 ))
                 await self._writer.drain()
             
-            await asyncio.wait_for(conn.established.wait(), timeout=30)
+            await asyncio.wait_for(conn.established.wait(), timeout=120) # 2 minute timeout
             if conn.closed.is_set(): 
                 raise ConnectionError("TCP connection failed to establish")
             
@@ -348,18 +341,11 @@ class Client:
             return conn
         except asyncio.TimeoutError:
             self._tcp_conns.pop(cid, None)
-            log.error("Failed to open TCP to %s:%s: Timeout waiting for Edge", host, port)
-            raise ConnectionError(f"Timeout connecting to {host}:{port}")
-        except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
-            self._tcp_conns.pop(cid, None)
-            log.error("Relay connection lost during open_tcp to %s:%s", host, port)
-            if self._read_task and not self._read_task.done():
-                self._read_task.cancel() # Force reconnect
-            raise
+            log.error("Edge took too long to respond (>120s)")
+            raise ConnectionError("Edge response timeout")
         except Exception as e:
             self._tcp_conns.pop(cid, None)
-            err_msg = str(e) or e.__class__.__name__
-            log.error("Failed to open TCP to %s:%s: %s", host, port, err_msg)
+            log.error("TCP open failed: %s", e)
             raise
 
     async def send_tcp_data(self, cid: bytes, data: bytes):
@@ -461,17 +447,9 @@ class Relay:
                 self._client_id_counter += 1
                 client_id = self._client_id_counter
                 
-                # Close old client gracefully and forcefully
+                # Don't kill old client immediately, just replace internal reference
                 if self.active_client and self.active_client != writer:
-                    log.info("Relay: New client %d, old client will be replaced", client_id)
-                    old_writer = self.active_client
-                    old_queue = self.client_queues.pop(old_writer, None)
-                    if old_queue:
-                        old_queue.put_nowait(None)
-                    try:
-                        old_writer.close()
-                    except Exception:
-                        pass
+                    log.info("Relay: New client connection, updating active client")
                 
                 self.active_client = writer
                 self.active_client_id = client_id
@@ -623,11 +601,11 @@ class Edge:
                     # Check if it's a control message (new client hello)
                     m_type, d_dict = parse_control_msg(f)
                     if m_type == "hello":
-                        log.info("Edge: New client session, resetting tunnel and clearing buffer")
-                        self.tunnel = AESTunnel(self.key)
+                        log.info("Edge: New client session acknowledged")
+                        # No longer resetting tunnel or clearing buffer
+                        # Random nonces + shared key = stateless persistence
                         await self._close_all_tcp()
-                        buf.clear() # Throw away any stale encrypted data
-                        break # Stop processing frames from the OLD buffer
+                        continue
                     
                     # Decrypt and handle message
                     try:

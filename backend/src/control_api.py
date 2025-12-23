@@ -129,11 +129,8 @@ async def _reconnect_loop():
                 
                 log.info("Reconnected successfully")
             
-            # Wait before checking again - shorter if disconnected, longer if connected
-            if _client and _client.is_connected():
-                await asyncio.sleep(5)
-            else:
-                await asyncio.sleep(1)
+            # Wait before checking again - very relaxed
+            await asyncio.sleep(20)
             
         except Exception as e:
             log.error("Reconnect loop error: %s", e)
