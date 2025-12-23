@@ -108,6 +108,10 @@ class Client:
             else:
                 log.warning("EDGE_PUBKEY_FILE present but not 32 bytes; ignoring")
 
+    def is_connected(self) -> bool:
+        """Check if the client is currently connected and healthy."""
+        return self._writer is not None and self._read_task is not None and not self._read_task.done()
+
     async def connect(self):
         """Establish persistent connection to relay."""
         async with self._conn_lock:
@@ -322,8 +326,11 @@ class AESTunnel:
 
     def decrypt(self, ciphertext: bytes) -> bytes:
         nonce = self.dec_nonce.to_bytes(12, "big")
-        self.dec_nonce += 1 # ALWAYS increment to stay in sync with stream
-        return AESGCM(self.key).decrypt(nonce, ciphertext, None)
+        # Try to decrypt first; only increment nonce if it's a valid packet for the current stream position.
+        # This allows us to survive "ghost" packets from a previous session that might linger in the network.
+        res = AESGCM(self.key).decrypt(nonce, ciphertext, None)
+        self.dec_nonce += 1
+        return res
 
 # Control frames are JSON
 
@@ -543,8 +550,9 @@ class Edge:
                     try:
                         msg_type, data_dict = parse_control_msg(f)
                         if msg_type == "hello":
-                            log.info("Edge: session reset by client hello (%s)", data_dict.get("role"))
+                            log.info("Edge: session reset by client hello (%s). Closing all TCP conns.", data_dict.get("role"))
                             self.tunnel.reset()
+                            await self._close_all_tcp()
                             continue
                     except Exception:
                         pass
@@ -728,8 +736,7 @@ async def main():
     
     upstream_dns = os.environ.get("UPSTREAM_DNS", "1.1.1.1")
 
-    with open(key_file, "rb") as f:
-        key = f.read()
+    key = load_key(key_file)
 
     if role == "relay":
         # Relay binds to HOST:PORT (e.g. 0.0.0.0:8443)

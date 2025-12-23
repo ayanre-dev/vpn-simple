@@ -5,8 +5,7 @@ from pydantic import BaseModel
 from dnslib import DNSRecord, RCODE
 
 from backend.src.logger import get_logger
-from backend.src.server import Client
-from backend.src.config import load_key
+from backend.src.server import Client, load_key
 from backend.src.dns_forwarder import DNSForwarder, DNSForwarderState
 from backend.src.socks5_proxy import Socks5Proxy, Socks5State  # new
 from fastapi.middleware.cors import CORSMiddleware
@@ -58,6 +57,7 @@ async def _set_client(client: Client | None, connected: bool, err: str | None):
 async def _ensure_dns_forwarder(client: Client, listen_host: str, listen_port: int):
     global _dns_forwarder
     if _dns_forwarder and _dns_forwarder.state == DNSForwarderState.RUNNING:
+        _dns_forwarder.update_client(client)
         return
     _dns_forwarder = DNSForwarder(client, listen_host, listen_port, log)
     await _dns_forwarder.start()
@@ -71,6 +71,7 @@ async def _stop_dns_forwarder():
 async def _ensure_socks_proxy(client: Client, listen_host: str, listen_port: int):
     global _socks_proxy
     if _socks_proxy:
+        _socks_proxy.update_client(client)
         return
     _socks_proxy = await Socks5Proxy.start(client, listen_host, listen_port, log)
 
@@ -84,7 +85,7 @@ async def _stop_socks_proxy():
 async def status():
     relay_host, relay_port, _, dns_query, *_rest = _config()
     return StatusResponse(
-        connected=_connected,
+        connected=_client.is_connected() if _client else False,
         relay_host=relay_host,
         relay_port=relay_port,
         dns_query=dns_query,
@@ -96,7 +97,7 @@ async def connect():
     async with _state_lock:
         (relay_host, relay_port, key_file, dns_query,
          dns_listen_host, dns_listen_port, socks_listen_host, socks_listen_port) = _config()
-        if _connected and _client:
+        if _client and _client.is_connected():
             return StatusResponse(connected=True, relay_host=relay_host, relay_port=relay_port, dns_query=dns_query, error=None)
         try:
             # Prefer handshake-only mode when EDGE_PUBKEY_FILE is configured
@@ -107,17 +108,8 @@ async def connect():
                 key = load_key(key_file)
                 client = Client(key, relay_host, relay_port)
             await _set_client(client, True, None)
-            
-            # Sync references if already running
-            if _dns_forwarder:
-                _dns_forwarder.update_client(client)
-            else:
-                await _ensure_dns_forwarder(client, dns_listen_host, dns_listen_port)
-                
-            if _socks_proxy:
-                _socks_proxy.update_client(client)
-            else:
-                await _ensure_socks_proxy(client, socks_listen_host, socks_listen_port)
+            await _ensure_dns_forwarder(client, dns_listen_host, dns_listen_port)
+            await _ensure_socks_proxy(client, socks_listen_host, socks_listen_port)
 
             return StatusResponse(connected=True, relay_host=relay_host, relay_port=relay_port, dns_query=dns_query, error=None)
         except Exception as e:  # noqa: BLE001

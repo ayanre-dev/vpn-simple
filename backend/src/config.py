@@ -12,9 +12,5 @@ class Config:
     TLS_CERT = os.getenv("TLS_CERT")
     TLS_KEY = os.getenv("TLS_KEY")
 
-def load_key(path: str) -> bytes:
-    with open(path, "rb") as f:
-        key = f.read().strip()
-    if len(key) != 32:
-        raise ValueError("Key must be 32 bytes")
-    return key
+
+# load_key is now in server.py
