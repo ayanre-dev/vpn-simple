@@ -31,7 +31,7 @@ def _derive_key(shared_secret: bytes, salt: bytes, info: bytes) -> bytes:
     return hkdf.derive(shared_secret)
 
 
-async def client_handshake(reader, writer, edge_pubkey: bytes) -> bytes:
+async def client_handshake(reader, writer, edge_pubkey: bytes, buf: bytearray | None = None) -> bytes:
     """
     Perform a one-way authenticated handshake (server-auth) and return a 32-byte session key.
     Messages are length-prefixed JSON frames sent in plaintext via the relay.
@@ -54,12 +54,10 @@ async def client_handshake(reader, writer, edge_pubkey: bytes) -> bytes:
     await writer.drain()
 
     # Read HS2
-    buf = bytearray()
+    if buf is None:
+        buf = bytearray()
+    
     while True:
-        data = await reader.read(4096)
-        if not data:
-            raise ConnectionError("Handshake aborted")
-        buf.extend(data)
         frames = decode_frames(buf)
         if frames:
             msg = json.loads(frames[0].decode())
@@ -69,6 +67,11 @@ async def client_handshake(reader, writer, edge_pubkey: bytes) -> bytes:
             e_nonce = _b64d(msg["e_nonce"])  # 16 bytes
             sig = _b64d(msg["sig"])  # 64 bytes
             break
+
+        data = await reader.read(4096)
+        if not data:
+            raise ConnectionError("Handshake aborted")
+        buf.extend(data)
 
     # Verify signature
     transcript = HS_PROTO_ID + c_eph_pk + e_eph + c_nonce + e_nonce
@@ -81,17 +84,15 @@ async def client_handshake(reader, writer, edge_pubkey: bytes) -> bytes:
     return session_key
 
 
-async def edge_handshake(reader, writer, edge_sk_bytes: bytes) -> bytes:
+async def edge_handshake(reader, writer, edge_sk_bytes: bytes, buf: bytearray | None = None) -> bytes:
     """
     Edge side of the handshake. Returns 32-byte session key.
     """
     # Read HS1
-    buf = bytearray()
+    if buf is None:
+        buf = bytearray()
+    
     while True:
-        data = await reader.read(4096)
-        if not data:
-            raise ConnectionError("Handshake aborted")
-        buf.extend(data)
         frames = decode_frames(buf)
         if frames:
             msg = json.loads(frames[0].decode())
@@ -102,6 +103,11 @@ async def edge_handshake(reader, writer, edge_sk_bytes: bytes) -> bytes:
             c_eph = _b64d(msg["c_eph"])  # 32 bytes
             c_nonce = _b64d(msg["c_nonce"])  # 16 bytes
             break
+
+        data = await reader.read(4096)
+        if not data:
+            raise ConnectionError("Handshake aborted")
+        buf.extend(data)
 
     # Prepare response
     e_eph_sk = x25519.X25519PrivateKey.generate()

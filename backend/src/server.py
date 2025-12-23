@@ -7,66 +7,16 @@ from typing import Optional, Dict
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from backend.src.logger import get_logger
+from backend.src.tunnel import AESTunnel, wrap_frame, unwrap_frames
 from shared.crypto_params import AES_KEY_BYTES, AES_NONCE_BYTES
-from shared.utils import encode_frame, decode_frames
+from shared.utils import encode_frame, decode_frames, enable_keepalive, maybe_tls, writer_task
+from shared.proto import (
+    control_msg, parse_control_msg,
+    TCP_INIT, TCP_READY, TCP_DATA, TCP_CLOSE, TCP_ERR
+)
+from shared.handshake import client_handshake, edge_handshake
 
 log = get_logger("server")
-
-
-def encode_frame(payload: bytes) -> bytes:
-    return len(payload).to_bytes(4, "big") + payload
-
-
-def decode_frames(buf: bytearray, max_size: int = 256 * 1024) -> list[bytes]:
-    frames = []
-    while len(buf) >= 4:
-        ln = int.from_bytes(buf[:4], "big")
-        if ln > max_size:
-            log.error("Frame too large (%d bytes), clearing buffer", ln)
-            buf.clear()
-            break
-        if len(buf) < 4 + ln:
-            break
-        frames.append(bytes(buf[4:4 + ln]))
-        del buf[: 4 + ln]
-    return frames
-
-
-def control_msg(msg_type: str, data: dict) -> bytes:
-    return json.dumps({"type": msg_type, "data": data}).encode()
-
-
-def parse_control_msg(payload: bytes) -> tuple[str, dict]:
-    try:
-        obj = json.loads(payload.decode())
-        return obj.get("type"), obj.get("data", {})
-    except Exception:
-        return None, {}
-
-
-def enable_keepalive(sock: socket.socket):
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        if hasattr(socket, "TCP_KEEPIDLE"):
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
-        if hasattr(socket, "TCP_KEEPINTVL"):
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
-        if hasattr(socket, "TCP_KEEPCNT"):
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
-        pass
-    except Exception:
-        pass
-
-
-TCP_INIT = 0
-TCP_READY = 1
-TCP_DATA = 2
-TCP_CLOSE = 3
-TCP_ERR = 4
-
-
-def _maybe_tls():
-    return ssl.create_default_context() if os.environ.get("USE_TLS") == "1" else None
 
 
 def load_key(path: str) -> bytes:
@@ -83,28 +33,7 @@ def load_key(path: str) -> bytes:
     with open(path, "wb") as f:
         f.write(key)
     log.warning("!!! NEW SHARED KEY GENERATED: %s !!!", path)
-    log.warning("IMPORTANT: YOU MUST COPY THIS FILE TO ALL MACHINES.")
     return key
-
-
-class AESTunnel:
-    def __init__(self, key: bytes):
-        if len(key) != AES_KEY_BYTES:
-            raise ValueError("Key must be %d bytes" % AES_KEY_BYTES)
-        self.key = key
-        self.aes = AESGCM(key)
-
-    def encrypt(self, plaintext: bytes) -> bytes:
-        nonce = os.urandom(AES_NONCE_BYTES)
-        ciphertext = self.aes.encrypt(nonce, plaintext, None)
-        return nonce + ciphertext
-
-    def decrypt(self, blob: bytes) -> bytes:
-        if len(blob) < AES_NONCE_BYTES + 1:
-            raise ValueError("Blob too short")
-        nonce = blob[:AES_NONCE_BYTES]
-        ciphertext = blob[AES_NONCE_BYTES:]
-        return self.aes.decrypt(nonce, ciphertext, None)
 
 
 class ClientTCPConnection:
@@ -132,8 +61,8 @@ class ClientTCPConnection:
         self.recv_q.put_nowait(None)
 
 class Client:
-    def __init__(self, key: bytes | None, relay_host: str, relay_port: int):
-        self.initial_key = key
+    def __init__(self, edge_pubkey: bytes, relay_host: str, relay_port: int):
+        self.edge_pubkey = edge_pubkey
         self.relay_host = relay_host
         self.relay_port = relay_port
         self.tunnel = None
@@ -161,7 +90,7 @@ class Client:
             
             try:
                 reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(self.relay_host, self.relay_port, ssl=_maybe_tls()),
+                    asyncio.open_connection(self.relay_host, self.relay_port, ssl=maybe_tls()),
                     timeout=10
                 )
                 
@@ -178,15 +107,16 @@ class Client:
             
             self._reader, self._writer = reader, writer
             
-            # Initialize tunnel with key
-            if not self.initial_key:
-                raise ValueError("Client requires a shared key")
-            self.tunnel = AESTunnel(self.initial_key)
-            
-            # Send hello
+            # Identify as client
             async with self._writer_lock:
                 writer.write(encode_frame(control_msg("hello", {"role": "client"})))
                 await writer.drain()
+
+            # Perform X25519 Handshake to get session key
+            log.info("Client: starting handshake with edge...")
+            session_key = await client_handshake(reader, writer, self.edge_pubkey)
+            self.tunnel = AESTunnel(session_key)
+            log.info("Client: handshake ok, session key derived")
             
             self._read_task = asyncio.create_task(self._read_loop())
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
@@ -230,9 +160,7 @@ class Client:
                     try:
                         msg = self.tunnel.decrypt(f)
                     except Exception as e:
-                        log.error("Client decrypt failed (len=%d, key_prefix=%s, nonce=%s, tag_failure=%s): %s", 
-                                 len(f), self.initial_key[:4].hex() if self.initial_key else "None",
-                                 f[:12].hex(), "likely" if len(f) >= 28 else "no", e)
+                        log.error("Client decrypt failed (len=%d): %s", len(f), e)
                         continue
                     
                     # Ignore heartbeat responses
@@ -393,26 +321,6 @@ class Relay:
         async with server: 
             await server.serve_forever()
 
-    async def _writer_task(self, writer, queue, name):
-        try:
-            while True:
-                data = await queue.get()
-                if data is None: 
-                    break
-                try:
-                    writer.write(data)
-                    await writer.drain()
-                except Exception as e:
-                    log.error("Writer task error for %s: %s", name, e)
-                    break
-                queue.task_done()
-        finally:
-            try: 
-                writer.close()
-                await writer.wait_closed()
-            except Exception: 
-                pass
-
     async def _handle_conn(self, reader, writer):
         peer = writer.get_extra_info("peername")
         
@@ -445,7 +353,7 @@ class Relay:
             log.info("Relay: %s connected from %s", role, peer)
             
             queue = asyncio.Queue()
-            w_task = asyncio.create_task(self._writer_task(writer, queue, role))
+            w_task = asyncio.create_task(writer_task(writer, queue, role, log))
             
             if role == "client":
                 self._client_id_counter += 1
@@ -559,8 +467,8 @@ class Relay:
                 break
 
 class Edge:
-    def __init__(self, key: bytes, relay_host: str, relay_port: int, upstream_dns="1.1.1.1"):
-        self.key = key
+    def __init__(self, edge_sk_bytes: bytes, relay_host: str, relay_port: int, upstream_dns="1.1.1.1"):
+        self.edge_sk_bytes = edge_sk_bytes
         self.tunnel = None
         self.relay_host = relay_host
         self.relay_port = relay_port
@@ -587,12 +495,12 @@ class Edge:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         
         self.writer = writer
-        self.tunnel = AESTunnel(self.key)
         
+        # Identify as edge
         async with self._writer_lock:
             writer.write(encode_frame(control_msg("hello", {"role": "edge"})))
             await writer.drain()
-        
+
         log.info("Edge connected to relay at %s:%s", self.relay_host, self.relay_port)
         
         buf = bytearray()
@@ -608,18 +516,27 @@ class Edge:
                     # Check if it's a control message (new client hello)
                     m_type, d_dict = parse_control_msg(f)
                     if m_type == "hello":
-                        log.info("Edge: New client session acknowledged")
-                        # No longer resetting tunnel or clearing buffer
-                        # Random nonces + shared key = stateless persistence
-                        await self._close_all_tcp()
+                        log.info("Edge: Client connected to relay, starting handshake...")
+                        # The client's HS1 is already in the buffer or arriving.
+                        # handshake.py's edge_handshake will read it from the same reader.
+                        try:
+                            # We pass the same reader/writer and any leftover buf to the handshake module
+                            session_key = await edge_handshake(reader, writer, self.edge_sk_bytes, buf)
+                            self.tunnel = AESTunnel(session_key)
+                            log.info("Edge: Handshake ok, session key derived")
+                            await self._close_all_tcp()
+                        except Exception as e:
+                            log.error("Edge handshake failed: %s", e)
                         continue
                     
                     # Decrypt and handle message
                     try:
+                        if not self.tunnel:
+                            log.debug("Edge: Frame received before handshake complete")
+                            continue
                         msg = self.tunnel.decrypt(f)
                     except Exception as e:
-                        log.error("Edge decrypt failed (len=%d, key_prefix=%s, nonce=%s): %s", 
-                                 len(f), self.key[:4].hex(), f[:12].hex(), e)
+                        log.error("Edge decrypt failed (len=%d): %s", len(f), e)
                         continue
                     
                     # Ignore heartbeat pings
@@ -766,12 +683,15 @@ class Edge:
 
 async def main():
     role = os.getenv("ROLE", "relay")
-    key = load_key(os.getenv("SHARED_KEY_FILE", "shared.key"))
+    key_file = os.getenv("SHARED_KEY_FILE", "shared.key")
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8443"))
     r_host = os.getenv("RELAY_HOST", "127.0.0.1")
     r_port = int(os.getenv("RELAY_PORT", "8443"))
     
+    # Use load_key for Ed private key (backwards compatible with shared.key)
+    key = load_key(key_file)
+
     if role == "relay": 
         await Relay(key, host, port).start()
     elif role == "edge": 

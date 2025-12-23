@@ -121,11 +121,13 @@ async def _reconnect_loop():
         socks_listen_port,
     ) = _config()
 
-    edge_pub = os.environ.get("EDGE_PUBKEY_FILE")
-    if edge_pub and os.path.exists(edge_pub):
-        key = None
+    edge_pub_file = os.environ.get("EDGE_PUBKEY_FILE")
+    if edge_pub_file and os.path.exists(edge_pub_file):
+        with open(edge_pub_file, "rb") as f:
+            edge_pubkey = f.read()
     else:
-        key = _ensure_key_length(load_key(key_file))
+        # Fallback to shared.key as "edge_pubkey" for legacy compatibility
+        edge_pubkey = load_key(key_file)
 
     try:
         while _should_stay_connected:
@@ -135,7 +137,7 @@ async def _reconnect_loop():
             try:
                 if not _client or not _client.is_connected():
                     log.info("Reconnecting to relay...")
-                    client = Client(key, relay_host, relay_port)
+                    client = Client(edge_pubkey, relay_host, relay_port)
                     await client.connect()
 
                     async with _state_lock:
@@ -228,13 +230,14 @@ async def connect():
             await _set_client(None, False, None)
 
         try:
-            edge_pub = os.environ.get("EDGE_PUBKEY_FILE")
-            if edge_pub and os.path.exists(edge_pub):
-                client = Client(None, relay_host, relay_port)
+            edge_pub_file = os.environ.get("EDGE_PUBKEY_FILE")
+            if edge_pub_file and os.path.exists(edge_pub_file):
+                with open(edge_pub_file, "rb") as f:
+                    edge_pubkey = f.read()
             else:
-                key = _ensure_key_length(load_key(key_file))
-                client = Client(key, relay_host, relay_port)
-
+                edge_pubkey = load_key(key_file)
+            
+            client = Client(edge_pubkey, relay_host, relay_port)
             await client.connect()
             await _set_client(client, True, None)
 
