@@ -5,6 +5,7 @@ import socket
 import ssl
 from typing import Optional, Dict
 
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from backend.src.logger import get_logger
 from shared.handshake import client_handshake, edge_handshake
 
@@ -87,6 +88,7 @@ class Client:
         self._writer: asyncio.StreamWriter | None = None
         self._reader: asyncio.StreamReader | None = None
         self._writer_lock = asyncio.Lock()
+        self._conn_lock = asyncio.Lock()
         
         self._read_task: asyncio.Task | None = None
         self._tcp_conns: Dict[bytes, ClientTCPConnection] = {}
@@ -108,31 +110,32 @@ class Client:
 
     async def connect(self):
         """Establish persistent connection to relay."""
-        if self._writer:
-            return  # Already connected
+        async with self._conn_lock:
+            if self._writer:
+                return  # Already connected
 
-        reader, writer = await asyncio.open_connection(
-            self.relay_host, self.relay_port, ssl=_maybe_tls()
-        )
-        async with self._writer_lock:
-            writer.write(encode_frame(control_msg("hello", {"role": "client"})))
-            await writer.drain()
+            reader, writer = await asyncio.open_connection(
+                self.relay_host, self.relay_port, ssl=_maybe_tls()
+            )
+            async with self._writer_lock:
+                writer.write(encode_frame(control_msg("hello", {"role": "client"})))
+                await writer.drain()
 
-        # Handshake
-        if self._edge_pubkey is not None:
-            session_key = await client_handshake(reader, writer, self._edge_pubkey)
-            self.tunnel = AESTunnel(session_key)
-        elif self.initial_key is not None:
-             self.tunnel = AESTunnel(self.initial_key)
-        else:
-             writer.close()
-             await writer.wait_closed()
-             raise RuntimeError("No handshake configured and no pre-shared key provided")
+            # Handshake
+            if self._edge_pubkey is not None:
+                session_key = await client_handshake(reader, writer, self._edge_pubkey)
+                self.tunnel = AESTunnel(session_key)
+            elif self.initial_key is not None:
+                self.tunnel = AESTunnel(self.initial_key)
+            else:
+                writer.close()
+                await writer.wait_closed()
+                raise RuntimeError("No handshake configured and no pre-shared key provided")
 
-        self._reader = reader
-        self._writer = writer
-        self._read_task = asyncio.create_task(self._read_loop())
-        log.info("Client connected to relay")
+            self._reader = reader
+            self._writer = writer
+            self._read_task = asyncio.create_task(self._read_loop())
+            log.info("Client connected to relay")
 
     async def _read_loop(self):
         buf = bytearray()
