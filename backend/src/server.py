@@ -322,9 +322,8 @@ class AESTunnel:
 
     def decrypt(self, ciphertext: bytes) -> bytes:
         nonce = self.dec_nonce.to_bytes(12, "big")
-        res = AESGCM(self.key).decrypt(nonce, ciphertext, None)
-        self.dec_nonce += 1 # Only increment if decrypt succeeded
-        return res
+        self.dec_nonce += 1 # ALWAYS increment to stay in sync with stream
+        return AESGCM(self.key).decrypt(nonce, ciphertext, None)
 
 # Control frames are JSON
 
@@ -456,6 +455,10 @@ class Relay:
                     except asyncio.QueueFull:
                         log.warning("Relay: client queue full, dropping packet")
             else:
+                # STRICT IDENTITY CHECK: Only allow the CURRENT active client to push to Edge
+                if writer is not self.active_client:
+                    return
+
                 if self.edge_queue:
                     try:
                         self.edge_queue.put_nowait(data)
