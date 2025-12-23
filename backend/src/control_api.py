@@ -109,6 +109,8 @@ async def _reconnect_loop():
                 
                 # Update global state
                 async with _state_lock:
+                    old_client = _client
+                    
                     # Clean up old client
                     if old_client:
                         try:
@@ -118,11 +120,20 @@ async def _reconnect_loop():
                     
                     _client = client
                     await _set_client(client, True, None)
+                    
+                    # Update proxy references
+                    if _dns_forwarder:
+                        _dns_forwarder.update_client(client)
+                    if _socks_proxy:
+                        _socks_proxy.update_client(client)
                 
                 log.info("Reconnected successfully")
             
-            # Wait before checking again
-            await asyncio.sleep(5)
+            # Wait before checking again - shorter if disconnected, longer if connected
+            if _client and _client.is_connected():
+                await asyncio.sleep(5)
+            else:
+                await asyncio.sleep(1)
             
         except Exception as e:
             log.error("Reconnect loop error: %s", e)

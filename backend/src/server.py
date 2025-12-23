@@ -228,8 +228,9 @@ class Client:
                     try:
                         msg = self.tunnel.decrypt(f)
                     except Exception as e:
-                        log.error("Client decrypt failed (len=%d, first 16 bytes: %s): %s", 
-                                 len(f), f[:16].hex() if len(f) >= 16 else f.hex(), e)
+                        log.error("Client decrypt failed (len=%d, key_prefix=%s, nonce=%s, tag_failure=%s): %s", 
+                                 len(f), self.initial_key[:4].hex() if self.initial_key else "None",
+                                 f[:12].hex(), "likely" if len(f) >= 28 else "no", e)
                         continue
                     
                     # Ignore heartbeat responses
@@ -337,9 +338,14 @@ class Client:
             
             log.info("TCP connection established to %s:%s", host, port)
             return conn
+        except asyncio.TimeoutError:
+            self._tcp_conns.pop(cid, None)
+            log.error("Failed to open TCP to %s:%s: Timeout waiting for Edge", host, port)
+            raise ConnectionError(f"Timeout connecting to {host}:{port}")
         except Exception as e:
             self._tcp_conns.pop(cid, None)
-            log.error("Failed to open TCP to %s:%s: %s", host, port, e)
+            err_msg = str(e) or e.__class__.__name__
+            log.error("Failed to open TCP to %s:%s: %s", host, port, err_msg)
             raise
 
     async def send_tcp_data(self, cid: bytes, data: bytes):
@@ -600,8 +606,8 @@ class Edge:
                     try:
                         msg = self.tunnel.decrypt(f)
                     except Exception as e:
-                        log.error("Edge decrypt failed (len=%d, first 16 bytes: %s): %s", 
-                                 len(f), f[:16].hex() if len(f) >= 16 else f.hex(), e)
+                        log.error("Edge decrypt failed (len=%d, key_prefix=%s, nonce=%s): %s", 
+                                 len(f), self.key[:4].hex(), f[:12].hex(), e)
                         continue
                     
                     # Ignore heartbeat pings
