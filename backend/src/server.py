@@ -290,32 +290,53 @@ class Client:
             pass
         self._tcp_conns.pop(cid, None)
 
-    async def close(self):
-        await self._cleanup()
-
-
-# ---------- Relay ----------
+def load_key(path: str) -> bytes:
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            return f.read()
+    key = os.urandom(32)
+    with open(path, "wb") as f:
+        f.write(key)
+    log.warning("!!! NEW SHARED KEY GENERATED: %s !!!", path)
+    log.warning("IMPORTANT: If you are running multiple PCs, YOU MUST COPY THIS FILE TO ALL MACHINES.")
+    return key
 
 class Relay:
     """
     Simple relay: one or more clients, one edge.
     First frame must be a plaintext control hello with role.
     All subsequent payloads are framed; relay forwards frames between client(s) and edge.
+    Uses per-client queues to guarantee packet ordering without head-of-line blocking.
     """
     def __init__(self, key: bytes, host: str, port: int):
         self.host = host
         self.port = port
         self.tunnel = AESTunnel(key)
-        self.edge_writer: Optional[asyncio.StreamWriter] = None
-        self.edge_writer_lock = asyncio.Lock()
-        self.clients: set[asyncio.StreamWriter] = set()
-        self.client_locks: dict[asyncio.StreamWriter, asyncio.Lock] = {}
+        self.edge_queue: Optional[asyncio.Queue] = None
+        self.clients: dict[asyncio.StreamWriter, asyncio.Queue] = {}
 
     async def start(self):
         server = await asyncio.start_server(self._handle_conn, host=self.host, port=self.port, ssl=None)
         log.info("Relay listening on %s:%s", self.host, self.port)
         async with server:
             await server.serve_forever()
+
+    async def _writer_task(self, writer: asyncio.StreamWriter, queue: asyncio.Queue, name: str):
+        """Dedicated task to pull from queue and write to socket to preserve order."""
+        try:
+            while True:
+                data = await queue.get()
+                if data is None: break
+                writer.write(data)
+                await writer.drain()
+                queue.task_done()
+        except Exception as e:
+            log.warning("Relay: writer task for %s failed: %s", name, e)
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception: pass
 
     async def _handle_conn(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         peer = writer.get_extra_info("peername")
@@ -324,14 +345,11 @@ class Relay:
             # Expect first frame as plaintext control msg
             while True:
                 chunk = await reader.read(4096)
-                if not chunk:
-                    return
+                if not chunk: return
                 buf.extend(chunk)
                 frames = decode_frames(buf)
                 if frames:
                     hello_frame = frames[0]
-                    # Any remaining frames in 'frames[1:]' and remaining bytes in 'buf'
-                    # must be preserved and forwarded after role identifies.
                     pending_frames = frames[1:]
                     break
             
@@ -339,84 +357,68 @@ class Relay:
             if msg_type != "hello" or "role" not in data:
                 log.warning("Relay: bad hello from %s", peer)
                 writer.close()
-                await writer.wait_closed()
                 return
             role = data["role"]
             log.info("Relay: %s connected from %s", role, peer)
 
+            queue = asyncio.Queue(maxsize=1000)
+            writer_task = asyncio.create_task(self._writer_task(writer, queue, f"{role}@{peer}"))
+
             # Re-assemble initial data: any trailing bytes in buf + pending frames
-            # Note: pending_frames are already decrypted/extracted payloads, 
-            # we must re-frame them for the pump.
             initial_data = bytearray()
             for f in pending_frames:
                 initial_data.extend(encode_frame(f))
             initial_data.extend(buf)
 
             if role == "edge":
-                self.edge_writer = writer
+                self.edge_queue = queue
                 await self._pump(reader, writer, from_edge=True, initial_buf=initial_data)
+                self.edge_queue = None
             elif role == "client":
-                self.clients.add(writer)
-                self.client_locks[writer] = asyncio.Lock()
+                self.clients[writer] = queue
                 await self._pump(reader, writer, from_edge=False, initial_buf=initial_data)
+                self.clients.pop(writer, None)
             else:
                 log.warning("Relay: unknown role %s from %s", role, peer)
-                writer.close()
-                await writer.wait_closed()
+
+            # Signal writer task to stop
+            queue.put_nowait(None)
+            await writer_task
+
         except Exception as e:
             log.exception("Relay conn error from %s: %s", peer, e)
         finally:
             try:
                 writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
-            if writer in self.clients:
-                self.clients.discard(writer)
-                self.client_locks.pop(writer, None)
-            if self.edge_writer is writer:
-                self.edge_writer = None
+            except Exception: pass
 
     async def _pump(self, reader, writer, from_edge: bool, initial_buf: bytearray = None):
-        """
-        Pass-through pump with background writing for clients to avoid head-of-line blocking.
-        """
-        async def safe_write_client(cw, chunk):
-            lock = self.client_locks.get(cw)
-            if not lock: return
-            async with lock:
-                try:
-                    cw.write(chunk)
-                    await cw.drain()
-                except Exception:
-                    self.clients.discard(cw)
-                    self.client_locks.pop(cw, None)
-
-        async def safe_write_edge(chunk):
-            if not self.edge_writer: return
-            async with self.edge_writer_lock:
-                try:
-                    self.edge_writer.write(chunk)
-                    await self.edge_writer.drain()
-                except Exception:
-                    self.edge_writer = None
+        """Pass-through pump. Ordered writes are handled by the _writer_task."""
+        
+        async def forward(data):
+            if from_edge:
+                for cw, q in list(self.clients.items()):
+                    try:
+                        q.put_nowait(data)
+                    except asyncio.QueueFull:
+                        log.warning("Relay: client queue full, dropping packet")
+            else:
+                if self.edge_queue:
+                    try:
+                        self.edge_queue.put_nowait(data)
+                    except asyncio.QueueFull:
+                        log.warning("Relay: edge queue full, dropping packet")
+                else:
+                    log.warning("Relay: dropping client packet, Edge NOT connected")
 
         if initial_buf and len(initial_buf) > 0:
-            if from_edge:
-                for cw in list(self.clients):
-                    asyncio.create_task(safe_write_client(cw, initial_buf))
-            else:
-                await safe_write_edge(initial_buf)
+            await forward(initial_buf)
 
         while True:
             data = await reader.read(4096)
             if not data:
                 break
-            if from_edge:
-                for cw in list(self.clients):
-                    asyncio.create_task(safe_write_client(cw, data))
-            else:
-                await safe_write_edge(data)
+            await forward(data)
         # end
 
 
