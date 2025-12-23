@@ -7,12 +7,15 @@ from typing import Optional, Dict
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from backend.src.logger import get_logger
+from shared.crypto_params import AES_KEY_BYTES, AES_NONCE_BYTES
+from shared.utils import encode_frame, decode_frames
 
 log = get_logger("server")
 
-# Frame helpers (length-prefixed)
+
 def encode_frame(payload: bytes) -> bytes:
     return len(payload).to_bytes(4, "big") + payload
+
 
 def decode_frames(buf: bytearray, max_size: int = 256 * 1024) -> list[bytes]:
     frames = []
@@ -24,12 +27,14 @@ def decode_frames(buf: bytearray, max_size: int = 256 * 1024) -> list[bytes]:
             break
         if len(buf) < 4 + ln:
             break
-        frames.append(bytes(buf[4 : 4 + ln]))
+        frames.append(bytes(buf[4:4 + ln]))
         del buf[: 4 + ln]
     return frames
 
+
 def control_msg(msg_type: str, data: dict) -> bytes:
     return json.dumps({"type": msg_type, "data": data}).encode()
+
 
 def parse_control_msg(payload: bytes) -> tuple[str, dict]:
     try:
@@ -38,74 +43,69 @@ def parse_control_msg(payload: bytes) -> tuple[str, dict]:
     except Exception:
         return None, {}
 
+
 def enable_keepalive(sock: socket.socket):
-    """Enable TCP keepalive on a socket to prevent connection drops."""
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        
-        # Platform-specific keepalive settings
-        if hasattr(socket, 'TCP_KEEPIDLE'):
-            # Linux: time before sending keepalive probes (seconds)
+        if hasattr(socket, "TCP_KEEPIDLE"):
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
-        if hasattr(socket, 'TCP_KEEPINTVL'):
-            # Linux: interval between keepalive probes (seconds)
+        if hasattr(socket, "TCP_KEEPINTVL"):
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
-        if hasattr(socket, 'TCP_KEEPCNT'):
-            # Linux: number of keepalive probes before giving up
+        if hasattr(socket, "TCP_KEEPCNT"):
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
-        
-        # Windows uses different settings - DISABLING SIO_KEEPALIVE_VALS as it causes WinError 121
-        # The app-level PING/PONG heartbeat is sufficient.
         pass
     except Exception:
         pass
 
-# TCP opcodes
+
 TCP_INIT = 0
 TCP_READY = 1
 TCP_DATA = 2
 TCP_CLOSE = 3
 TCP_ERR = 4
 
+
 def _maybe_tls():
     return ssl.create_default_context() if os.environ.get("USE_TLS") == "1" else None
+
 
 def load_key(path: str) -> bytes:
     if os.path.exists(path):
         with open(path, "rb") as f:
-            return f.read()
+            key = f.read()
+        if len(key) == AES_KEY_BYTES:
+            return key
+        log.warning("Shared key %s had incorrect length (%d bytes); regenerating", path, len(key))
     dir_name = os.path.dirname(os.path.abspath(path))
     if dir_name:
         os.makedirs(dir_name, exist_ok=True)
-    key = os.urandom(32)
+    key = os.urandom(AES_KEY_BYTES)
     with open(path, "wb") as f:
         f.write(key)
     log.warning("!!! NEW SHARED KEY GENERATED: %s !!!", path)
     log.warning("IMPORTANT: YOU MUST COPY THIS FILE TO ALL MACHINES.")
     return key
 
+
 class AESTunnel:
-    """
-    Uses random nonces prepended to ciphertext instead of sequential counters.
-    This prevents nonce desynchronization issues.
-    """
     def __init__(self, key: bytes):
-        if len(key) != 32:
-            raise ValueError("Key must be 32 bytes")
+        if len(key) != AES_KEY_BYTES:
+            raise ValueError("Key must be %d bytes" % AES_KEY_BYTES)
         self.key = key
         self.aes = AESGCM(key)
 
     def encrypt(self, plaintext: bytes) -> bytes:
-        nonce = os.urandom(12)  # Random nonce each time
+        nonce = os.urandom(AES_NONCE_BYTES)
         ciphertext = self.aes.encrypt(nonce, plaintext, None)
-        return nonce + ciphertext  # Prepend nonce to ciphertext
+        return nonce + ciphertext
 
     def decrypt(self, blob: bytes) -> bytes:
-        if len(blob) < 13:  # 12-byte nonce + at least 1 byte ciphertext
+        if len(blob) < AES_NONCE_BYTES + 1:
             raise ValueError("Blob too short")
-        nonce = blob[:12]
-        ciphertext = blob[12:]
+        nonce = blob[:AES_NONCE_BYTES]
+        ciphertext = blob[AES_NONCE_BYTES:]
         return self.aes.decrypt(nonce, ciphertext, None)
+
 
 class ClientTCPConnection:
     def __init__(self, cid: bytes, client: "Client"):
