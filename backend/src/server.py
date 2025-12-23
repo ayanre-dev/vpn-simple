@@ -317,16 +317,14 @@ class AESTunnel:
 
     def encrypt(self, plaintext: bytes) -> bytes:
         nonce = self.enc_nonce.to_bytes(12, "big")
-        aesgcm = AESGCM(self.key)
         self.enc_nonce += 1
-        return aesgcm.encrypt(nonce, plaintext, None)
+        return AESGCM(self.key).encrypt(nonce, plaintext, None)
 
     def decrypt(self, ciphertext: bytes) -> bytes:
         nonce = self.dec_nonce.to_bytes(12, "big")
-        aesgcm = AESGCM(self.key)
-        self.dec_nonce += 1
-        return aesgcm.decrypt(nonce, ciphertext, None)
-
+        res = AESGCM(self.key).decrypt(nonce, ciphertext, None)
+        self.dec_nonce += 1 # Only increment if decrypt succeeded
+        return res
 
 # Control frames are JSON
 
@@ -344,7 +342,7 @@ class Relay:
         self.tunnel = AESTunnel(key)
         self.edge_queue: Optional[asyncio.Queue] = None
         self.active_client: Optional[asyncio.StreamWriter] = None
-        self.clients: dict[asyncio.StreamWriter, asyncio.Queue] = {}
+        self.client_queues: dict[asyncio.StreamWriter, asyncio.Queue] = {}
 
     async def start(self):
         server = await asyncio.start_server(self._handle_conn, host=self.host, port=self.port, ssl=None)
@@ -396,18 +394,25 @@ class Relay:
             writer_task = asyncio.create_task(self._writer_task(writer, queue, f"{role}@{peer}"))
 
             if role == "client":
-                # ENFORCE SINGLE CLIENT: Discard old ones.
-                if self.active_client and self.active_client in self.clients:
+                # ENFORCE SINGLE CLIENT: Discard old ones and clear queue.
+                if self.active_client and self.active_client in self.client_queues:
                     log.info("Relay: disconnecting stale client to start new session")
-                    old_q = self.clients.pop(self.active_client)
+                    old_q = self.client_queues.pop(self.active_client)
                     old_q.put_nowait(None) 
                 
                 self.active_client = writer
-                self.clients[writer] = queue
+                self.client_queues[writer] = queue
                 
-                # FORWARD HELLO to Edge to trigger session reset
+                # CLEAR EDGE QUEUE to prevent stale packets from previous client sessions
                 if self.edge_queue:
-                    log.info("Relay: forwarding hello to Edge for session sync")
+                    while not self.edge_queue.empty():
+                        try:
+                            self.edge_queue.get_nowait()
+                            self.edge_queue.task_done()
+                        except (asyncio.QueueEmpty, ValueError):
+                            break
+                    log.info("Relay: Edge queue cleared for new session")
+                    # FORWARD HELLO to Edge to trigger session reset
                     self.edge_queue.put_nowait(encode_frame(hello_frame))
 
             # Re-assemble initial data: any trailing bytes in buf + pending frames
@@ -422,7 +427,7 @@ class Relay:
                 self.edge_queue = None
             elif role == "client":
                 await self._pump(reader, writer, from_edge=False, initial_buf=initial_data)
-                self.clients.pop(writer, None)
+                self.client_queues.pop(writer, None)
                 if self.active_client is writer:
                     self.active_client = None
             else:
@@ -445,7 +450,7 @@ class Relay:
         async def forward(data):
             if from_edge:
                 # Still broadcast to all (normally just one), but prioritize active
-                for cw, q in list(self.clients.items()):
+                for cw, q in list(self.client_queues.items()):
                     try:
                         q.put_nowait(data)
                     except asyncio.QueueFull:
