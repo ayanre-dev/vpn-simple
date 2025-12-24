@@ -28,3 +28,19 @@ PY
 - Client (CLI or control API): set `EDGE_PUBKEY_FILE` to the path of `edge_pk.bin`.
 
 When these env vars are set, the client and edge perform the handshake automatically and derive a fresh AES-GCM key per connection. If unset, the system falls back to the existing `shared.key` PSK.
+
+### Important: Run Chrome Through PowerShell (Required)
+
+# You MUST launch Google Chrome using the following command in PowerShell.
+# Only then will the browser traffic pass through our SOCKS5 proxy and be captured by our code and logs.
+
+If you open Chrome normally, traffic will *NOT* be routed through the proxy.
+
+# PowerShell Command (Run Exactly As Below)
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" --proxy-server="socks5://127.0.0.1:1080" --user-data-dir="$env:TEMP\chrome-vpn-profile" --no-first-run "https://www.whatismyip.com"
+
+# Why This Is Necessary
+- Forces Chrome to use our SOCKS5 proxy (127.0.0.1:1080)
+- Ensures all browser traffic goes through our VPN logic
+- Allows proper logging, monitoring, and verification
+- Uses a separate Chrome profile to avoid conflicts with existing sessions
