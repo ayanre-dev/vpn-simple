@@ -1,33 +1,57 @@
 # vpn-simple
 Bootstrap with ./bootstrap.sh
 
-## Optional: Authenticated Key Exchange (no shared.key)
+## Overall Project Flow
 
-You can enable a per-connection session key using an Ed25519-authenticated X25519 handshake (Noise-like). This removes the need to distribute a symmetric `shared.key` and provides forward secrecy.
+This VPN implementation follows a hub-and-spoke architecture with a central relay and multiple edge nodes/daemons.
 
-- Server auth: Edge signs the handshake with its Ed25519 private key; clients verify using the pinned Ed25519 public key.
-- Key derivation: X25519 ECDH + HKDF-SHA256 → 32-byte AES-GCM key.
-
-### Generate keys (Python)
-
-```bash
-python - <<'PY'
-from cryptography.hazmat.primitives.asymmetric import ed25519
-from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-sk = ed25519.Ed25519PrivateKey.generate()
-pk = sk.public_key()
-open('edge_sk.bin','wb').write(sk.private_bytes(Encoding.Raw, PublicFormat.Raw, None))
-open('edge_pk.bin','wb').write(pk.public_bytes(Encoding.Raw, PublicFormat.Raw))
-print('Wrote edge_sk.bin (32B) and edge_pk.bin (32B)')
-PY
+```mermaid
+graph TD
+    User["User Browser (Chrome)"] -- "SOCKS5 (1080)" --> API["Control API (Client Daemon)"]
+    API -- "Encrypted Tunnel" --> Relay["Relay Server (8443)"]
+    Relay -- "Encrypted Tunnel" --> Edge["Edge Node"]
+    Edge -- "Target Request" --> Internet["Internet / Target Network"]
+    
+    Web["Web UI (4173)"] -- "REST API" --> API
 ```
 
-### Run with handshake
+1.  **Relay Server**: Acting as the orchestrator, it bridges traffic between edge nodes and client daemons.
+2.  **Edge Node**: The exit point of the VPN. It connects to the relay and awaits data to forward to the destination.
+3.  **Control API (Client Daemon)**: Runs locally on the user's machine. It exposes a SOCKS5 proxy server and a control interface.
+4.  **Web UI**: A Vite-based dashboard for monitoring connection health, performance, and logs.
 
-- Edge: set `EDGE_SK_FILE` to the path of `edge_sk.bin`.
-- Client (CLI or control API): set `EDGE_PUBKEY_FILE` to the path of `edge_pk.bin`.
+---
 
-When these env vars are set, the client and edge perform the handshake automatically and derive a fresh AES-GCM key per connection. If unset, the system falls back to the existing `shared.key` PSK.
+## Getting Started
+
+### 1. Setup Environment
+Ensure you have Python 3.10+ installed. Install dependencies:
+```bash
+pip install -r backend/requirements.txt
+cd frontend/web-ui && npm install
+```
+
+### 2. Run the System
+The easiest way to start all components on Windows is via the provided PowerShell script:
+
+```powershell
+./scripts/start_all.ps1
+```
+
+This script will launch four separate PowerShell windows:
+- **Server**: The relay bridge.
+- **Edge Node**: The exit node.
+- **Control API**: The client daemon (SOCKS5 proxy).
+- **Web UI**: The management dashboard.
+
+### 3. Individual Component Scripts
+If you need to run components manually or on Linux:
+- `relay`: Run `./scripts/run_server.ps1` (or `run_server.sh`)
+- `edge`: Run `./scripts/run_edge.ps1`
+- `api`: Run `./scripts/run_api.ps1`
+- `web`: Run `./scripts/run_web.ps1` (or `run_web.sh`)
+
+---
 
 # Important: Run Chrome Through PowerShell (Required)
 
