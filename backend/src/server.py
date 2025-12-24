@@ -4,7 +4,6 @@ import os
 import socket
 import ssl
 from typing import Optional, Dict
-
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from backend.src.logger import get_logger
 

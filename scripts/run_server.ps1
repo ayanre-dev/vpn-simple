@@ -1,6 +1,6 @@
 $env:ROLE = "relay"
-$env:HOST = "0.0.0.0"
-$env:PORT = "8443"              # use 443 on VPS if you can
+$env:RELAY_HOST = "0.0.0.0"
+$env:RELAY_PORT = "8443"              # use 443 on VPS if you can
 $env:SHARED_KEY_FILE = "shared.key"
 $env:PYTHONPATH = "$PSScriptRoot/.."
 
